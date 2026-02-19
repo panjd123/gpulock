@@ -14,25 +14,36 @@
 ## 用法
 
 ```bash
-./gpulock --mode write <gpu_id> "原本命令"
+./gpulock perf <gpu_id> -- 原本命令 参数...
 # 或
-./gpulock --mode read <gpu_id> -- 原本命令 参数1 参数2
+./gpulock check <gpu_id> -- 原本命令 参数...
 ```
 
 例子：
 
 ```bash
-./gpulock --mode write 1 "CUDA_VISIBLE_DEVICES=1 ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10"
-./gpulock --mode read 1 -- /opt/base/bin/python tests/topk_correctness.py
+./gpulock perf 1 -- ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10
+./gpulock check 1 -- /opt/base/bin/python tests/topk_correctness.py
 ```
 
 ## 读写锁语义
 
-- `--mode write`（性能测试）：写锁，完全互斥
+- `perf`（性能测试）：写锁，完全互斥
   - 不允许任何其他 `write` 或 `read` 共存
-- `--mode read`（正确性/功能测试）：读锁，可并发
+- `check`（正确性/功能测试）：读锁，可并发
   - 多个 `read` 可以共存
   - 与 `write` 互斥
+
+## 兼容形式
+
+老形式依然可用：
+
+```bash
+gpulock --mode write <gpu_id> -- <cmd>
+gpulock --mode read <gpu_id> -- <cmd>
+gpulock --perf <gpu_id> -- <cmd>
+gpulock --check <gpu_id> -- <cmd>
+```
 
 ## 全局安装
 
@@ -49,7 +60,10 @@ gpulock --help
 2. `/var/lock/gpu-benchmark`
 3. `/tmp/gpu_benchmark_locks`
 
-锁文件名：`${lock_root}/gpu<gpu_id>.lock`
+锁目录布局：
+
+- 写锁：`${lock_root}/gpu<gpu_id>/write.lock`
+- 读锁：`${lock_root}/gpu<gpu_id>/readers/reader-*.lock`
 
 ## 关键参数（可用环境变量或 CLI）
 

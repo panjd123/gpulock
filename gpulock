@@ -20,6 +20,17 @@ from typing import Optional
 
 READ_MODE = "read"
 WRITE_MODE = "write"
+MODE_ALIAS_MAP = {
+    "perf": WRITE_MODE,
+    "bench": WRITE_MODE,
+    "benchmark": WRITE_MODE,
+    "write": WRITE_MODE,
+    "check": READ_MODE,
+    "correctness": READ_MODE,
+    "functional": READ_MODE,
+    "test": READ_MODE,
+    "read": READ_MODE,
+}
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -452,25 +463,29 @@ class GpuBenchLock:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    default_mode = os.getenv("GPU_BENCH_LOCK_MODE", WRITE_MODE).strip().lower()
-    if default_mode not in (READ_MODE, WRITE_MODE):
-        default_mode = WRITE_MODE
-
     parser = argparse.ArgumentParser(
         prog="gpulock",
-        description="GPU benchmark lock wrapper: gpulock [--mode read|write] <gpu_id> \"<command>\"",
+        description=(
+            "GPU benchmark lock wrapper. Preferred forms: "
+            "gpulock perf <gpu_id> -- <cmd> / gpulock check <gpu_id> -- <cmd>"
+        ),
     )
+    parser.add_argument("--perf", action="store_true", help="Shortcut for performance mode (write lock).")
+    parser.add_argument("--check", action="store_true", help="Shortcut for correctness mode (read lock).")
     parser.add_argument(
         "--mode",
         choices=[WRITE_MODE, READ_MODE],
-        default=default_mode,
+        default=None,
         help="Lock mode. write=exclusive (performance); read=shared (correctness/functional).",
     )
     parser.add_argument("gpu_id", type=int, help="Physical GPU index to lock (nvidia-smi index).")
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="Command to run. Examples: gpulock --mode write 1 \"python bench.py\" or gpulock --mode read 1 -- python test.py",
+        help=(
+            "Command to run. Examples: gpulock perf 1 -- python bench.py "
+            "or gpulock check 1 -- python test.py"
+        ),
     )
     parser.add_argument("--poll-ms", type=int, default=LockConfig.poll_ms)
     parser.add_argument("--timeout-s", type=int, default=LockConfig.timeout_s)
@@ -486,11 +501,44 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _rewrite_argv_mode_alias(argv: list[str]) -> list[str]:
+    if not argv:
+        return argv
+
+    first = argv[0].strip().lower()
+    mapped = MODE_ALIAS_MAP.get(first)
+    if mapped is None:
+        return argv
+
+    for token in argv[1:]:
+        if token in ("--mode", "--perf", "--check"):
+            return argv
+    return ["--mode", mapped] + argv[1:]
+
+
+def _resolve_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    if args.perf and args.check:
+        parser.error("--perf and --check cannot be used together")
+
+    if args.perf:
+        mode = WRITE_MODE
+    elif args.check:
+        mode = READ_MODE
+    elif args.mode is not None:
+        mode = args.mode
+    else:
+        mode = os.getenv("GPU_BENCH_LOCK_MODE", WRITE_MODE).strip().lower()
+        if mode not in (READ_MODE, WRITE_MODE):
+            mode = WRITE_MODE
+    return mode
+
+
 def _normalize_command(raw: list[str]) -> tuple[str, bool]:
     if not raw:
         raise ValueError(
-            "Missing command. Usage: gpulock [--mode read|write] <gpu_id> \"<cmd>\" "
-            "or gpulock [--mode read|write] <gpu_id> -- <cmd> [args...]"
+            "Missing command. Usage: gpulock perf <gpu_id> -- <cmd> "
+            "or gpulock check <gpu_id> -- <cmd> "
+            "or gpulock [--mode read|write] <gpu_id> -- <cmd>"
         )
     if raw[0] == "--":
         raw = raw[1:]
@@ -503,7 +551,8 @@ def _normalize_command(raw: list[str]) -> tuple[str, bool]:
 
 def main() -> int:
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(_rewrite_argv_mode_alias(sys.argv[1:]))
+    mode = _resolve_mode(args, parser)
 
     cfg = LockConfig(
         poll_ms=max(args.poll_ms, 1),
@@ -515,7 +564,7 @@ def main() -> int:
     )
     command, shell_mode = _normalize_command(args.command)
 
-    lock = GpuBenchLock(args.gpu_id, mode=args.mode, config=cfg)
+    lock = GpuBenchLock(args.gpu_id, mode=mode, config=cfg)
     try:
         lock.acquire()
     except TimeoutError as e:
