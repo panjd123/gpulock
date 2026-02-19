@@ -47,7 +47,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 @dataclass
 class LockConfig:
     poll_ms: int = _env_int("GPU_BENCH_LOCK_POLL_MS", 200)
-    timeout_s: int = _env_int("GPU_BENCH_LOCK_TIMEOUT_S", 300)
+    timeout_s: int = _env_int("GPU_BENCH_LOCK_TIMEOUT_S", 1800)
     grace_age_s: int = _env_int("GPU_BENCH_LOCK_GRACE_AGE_S", 180)
     heartbeat_s: int = _env_int("GPU_BENCH_LOCK_HEARTBEAT_S", 2)
     orphan_check_s: int = _env_int("GPU_BENCH_LOCK_ORPHAN_CHECK_S", 5)

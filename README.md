@@ -68,7 +68,7 @@ gpulock --help
 ## 关键参数（可用环境变量或 CLI）
 
 - `GPU_BENCH_LOCK_POLL_MS` / `--poll-ms`（默认 200）
-- `GPU_BENCH_LOCK_TIMEOUT_S` / `--timeout-s`（默认 300）
+- `GPU_BENCH_LOCK_TIMEOUT_S` / `--timeout-s`（默认 1800，30 分钟）
 - `GPU_BENCH_LOCK_GRACE_AGE_S` / `--grace-age-s`（默认 180）
 - `GPU_BENCH_LOCK_HEARTBEAT_S` / `--heartbeat-s`（默认 2）
 - `GPU_BENCH_LOCK_ORPHAN_CHECK_S` / `--orphan-check-s`（默认 5）
