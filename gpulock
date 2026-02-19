@@ -1,6 +1,9 @@
 #!/opt/base/bin/python
 import argparse
 import atexit
+import contextlib
+import errno
+import fcntl
 import os
 import shlex
 import signal
@@ -9,9 +12,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+READ_MODE = "read"
+WRITE_MODE = "write"
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -33,6 +41,14 @@ class LockConfig:
     heartbeat_s: int = _env_int("GPU_BENCH_LOCK_HEARTBEAT_S", 2)
     orphan_check_s: int = _env_int("GPU_BENCH_LOCK_ORPHAN_CHECK_S", 5)
     orphan_empty_threshold: int = _env_int("GPU_BENCH_LOCK_ORPHAN_EMPTY_THRESHOLD", 6)
+
+
+@dataclass
+class ProbeState:
+    last_probe_s: float = 0.0
+    last_mtime_ns: int = -1
+    last_hb_ms: int = -1
+    empty_count: int = 0
 
 
 def _normalize_uuid(u: str) -> str:
@@ -70,7 +86,7 @@ def _gpu_uuid_by_index(index: int) -> Optional[str]:
 def _gpu_has_processes_by_index(index: int) -> bool:
     target_uuid = _gpu_uuid_by_index(index)
     if target_uuid is None:
-        # Fail-safe: if cannot query GPU mapping, never auto-delete existing lock.
+        # Fail-safe: if GPU mapping cannot be queried, do not auto-delete locks.
         return True
     ok, out = _run_cmd(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"])
     if not ok:
@@ -90,6 +106,19 @@ def _gpu_has_processes_by_index(index: int) -> bool:
         if pid > 0:
             return True
     return False
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return False
+        # EPERM still means process exists.
+        return e.errno == errno.EPERM
+    return True
 
 
 def resolve_lock_root() -> Path:
@@ -121,36 +150,84 @@ def resolve_lock_root() -> Path:
         return fallback_root
 
 
-def _read_last_heartbeat_ms(lock_path: Path) -> int:
+def _read_lock_metadata(lock_path: Path) -> dict[str, str]:
+    meta: dict[str, str] = {}
     try:
         data = lock_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
-        return -1
+        return meta
     for line in data.splitlines():
-        if line.startswith("last_heartbeat_ms="):
-            try:
-                return int(line.split("=", 1)[1].strip())
-            except ValueError:
-                return -1
-    return -1
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        meta[k.strip()] = v.strip()
+    return meta
+
+
+def _read_lock_pid(lock_path: Path) -> Optional[int]:
+    meta = _read_lock_metadata(lock_path)
+    raw = meta.get("pid", "")
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _read_last_heartbeat_ms(lock_path: Path) -> int:
+    meta = _read_lock_metadata(lock_path)
+    raw = meta.get("last_heartbeat_ms", "")
+    if raw == "":
+        return -1
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
 
 
 class GpuBenchLock:
-    def __init__(self, physical_device_id: int, config: Optional[LockConfig] = None):
+    def __init__(self, physical_device_id: int, mode: str, config: Optional[LockConfig] = None):
+        if mode not in (READ_MODE, WRITE_MODE):
+            raise ValueError(f"Unsupported mode: {mode}")
+
         self.physical_device_id = int(physical_device_id)
+        self.mode = mode
         self.config = config or LockConfig()
         self.root = resolve_lock_root()
-        self.lock_path = self.root / f"gpu{self.physical_device_id}.lock"
+
+        self.gpu_dir = self.root / f"gpu{self.physical_device_id}"
+        self.readers_dir = self.gpu_dir / "readers"
+        self.writer_path = self.gpu_dir / "write.lock"
+        self.gate_path = self.gpu_dir / "state.lock"
+
+        self.lock_path: Optional[Path] = None
         self.fd: Optional[int] = None
         self.start_time = time.time()
+
         self._stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._old_handlers: dict[int, signal.Handlers] = {}
         self._registered_atexit = False
-        self._orphan_last_probe = 0.0
-        self._orphan_last_mtime_ns = -1
-        self._orphan_last_hb = -1
-        self._orphan_empty_count = 0
+        self._orphan_probe: dict[str, ProbeState] = {}
+
+        self._ensure_layout()
+
+    def _ensure_layout(self) -> None:
+        self.gpu_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.readers_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    @contextlib.contextmanager
+    def _state_gate(self):
+        gate_fd = os.open(self.gate_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(gate_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(gate_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(gate_fd)
 
     def _lock_payload(self, now_ms: int) -> str:
         cmdline = " ".join(shlex.quote(x) for x in sys.argv)
@@ -158,6 +235,7 @@ class GpuBenchLock:
             f"pid={os.getpid()}\n"
             f"hostname={socket.gethostname()}\n"
             f"device_id={self.physical_device_id}\n"
+            f"lock_mode={self.mode}\n"
             f"start_time={self.start_time:.3f}\n"
             f"cmdline={cmdline}\n"
             f"last_heartbeat_ms={now_ms}\n"
@@ -182,7 +260,7 @@ class GpuBenchLock:
                 except Exception:
                     return
 
-        self._heartbeat_thread = threading.Thread(target=_loop, name="gpu-bench-lock-heartbeat", daemon=True)
+        self._heartbeat_thread = threading.Thread(target=_loop, name="gpulock-heartbeat", daemon=True)
         self._heartbeat_thread.start()
 
     def _register_signal_cleanup(self) -> None:
@@ -206,104 +284,163 @@ class GpuBenchLock:
                 pass
         self._old_handlers.clear()
 
-    def _maybe_cleanup_orphan_lock(self) -> None:
+    def _reader_paths_locked(self) -> list[Path]:
+        if not self.readers_dir.exists():
+            return []
+        return sorted(self.readers_dir.glob("*.lock"))
+
+    def _reset_probe_state(self, lock_path: Path) -> None:
+        self._orphan_probe.pop(str(lock_path), None)
+
+    def _try_cleanup_orphan(self, lock_path: Path, now_s: float) -> None:
         try:
-            st = self.lock_path.stat()
+            st = lock_path.stat()
         except FileNotFoundError:
-            self._orphan_empty_count = 0
-            self._orphan_last_mtime_ns = -1
-            self._orphan_last_hb = -1
+            self._reset_probe_state(lock_path)
             return
 
-        now = time.time()
-        age_s = now - st.st_mtime
+        age_s = now_s - st.st_mtime
         if age_s <= self.config.grace_age_s:
-            # Fresh lock: always wait, never reclaim.
-            self._orphan_empty_count = 0
-            self._orphan_last_mtime_ns = -1
-            self._orphan_last_hb = -1
+            self._reset_probe_state(lock_path)
             return
 
-        if now - self._orphan_last_probe < self.config.orphan_check_s:
+        pid = _read_lock_pid(lock_path)
+        if pid is not None and _pid_exists(pid):
+            self._reset_probe_state(lock_path)
             return
-        self._orphan_last_probe = now
+
+        key = str(lock_path)
+        state = self._orphan_probe.setdefault(key, ProbeState())
+        if now_s - state.last_probe_s < self.config.orphan_check_s:
+            return
+        state.last_probe_s = now_s
 
         if _gpu_has_processes_by_index(self.physical_device_id):
-            self._orphan_empty_count = 0
-            self._orphan_last_mtime_ns = -1
-            self._orphan_last_hb = -1
+            state.empty_count = 0
+            state.last_mtime_ns = -1
+            state.last_hb_ms = -1
             return
 
-        hb = _read_last_heartbeat_ms(self.lock_path)
+        hb = _read_last_heartbeat_ms(lock_path)
         mtime_ns = st.st_mtime_ns
 
-        if hb == self._orphan_last_hb and mtime_ns == self._orphan_last_mtime_ns:
-            self._orphan_empty_count += 1
+        if hb == state.last_hb_ms and mtime_ns == state.last_mtime_ns:
+            state.empty_count += 1
         else:
-            self._orphan_empty_count = 1
-            self._orphan_last_hb = hb
-            self._orphan_last_mtime_ns = mtime_ns
+            state.empty_count = 1
+            state.last_hb_ms = hb
+            state.last_mtime_ns = mtime_ns
 
-        if self._orphan_empty_count >= self.config.orphan_empty_threshold and age_s > self.config.grace_age_s:
+        if state.empty_count < self.config.orphan_empty_threshold:
+            return
+
+        try:
+            st2 = lock_path.stat()
+        except FileNotFoundError:
+            self._reset_probe_state(lock_path)
+            return
+
+        hb2 = _read_last_heartbeat_ms(lock_path)
+        age2 = time.time() - st2.st_mtime
+        pid2 = _read_lock_pid(lock_path)
+
+        if (
+            age2 > self.config.grace_age_s
+            and hb2 == state.last_hb_ms
+            and st2.st_mtime_ns == state.last_mtime_ns
+            and (pid2 is None or not _pid_exists(pid2))
+            and not _gpu_has_processes_by_index(self.physical_device_id)
+        ):
             try:
-                st2 = self.lock_path.stat()
+                lock_path.unlink()
             except FileNotFoundError:
-                self._orphan_empty_count = 0
-                self._orphan_last_mtime_ns = -1
-                self._orphan_last_hb = -1
-                return
-            hb2 = _read_last_heartbeat_ms(self.lock_path)
-            age2 = time.time() - st2.st_mtime
-            if (
-                age2 > self.config.grace_age_s
-                and hb2 == self._orphan_last_hb
-                and st2.st_mtime_ns == self._orphan_last_mtime_ns
-                and not _gpu_has_processes_by_index(self.physical_device_id)
-            ):
-                try:
-                    self.lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-            self._orphan_empty_count = 0
-            self._orphan_last_mtime_ns = -1
-            self._orphan_last_hb = -1
+                pass
+
+        self._reset_probe_state(lock_path)
+
+    def _cleanup_orphans_locked(self) -> None:
+        now_s = time.time()
+        candidates: list[Path] = []
+        if self.writer_path.exists():
+            candidates.append(self.writer_path)
+        candidates.extend(self._reader_paths_locked())
+
+        seen = {str(p) for p in candidates}
+        for stale_key in list(self._orphan_probe.keys()):
+            if stale_key not in seen:
+                self._orphan_probe.pop(stale_key, None)
+
+        for lock_path in candidates:
+            self._try_cleanup_orphan(lock_path, now_s)
+
+    def _acquire_write_locked(self) -> Optional[str]:
+        if self.writer_path.exists():
+            return f"writer lock exists: {self.writer_path}"
+        readers = self._reader_paths_locked()
+        if readers:
+            return f"{len(readers)} reader lock(s) active"
+
+        self.lock_path = self.writer_path
+        self.fd = os.open(self.writer_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self._write_heartbeat()
+        return None
+
+    def _acquire_read_locked(self) -> Optional[str]:
+        if self.writer_path.exists():
+            return f"writer lock exists: {self.writer_path}"
+
+        rid = uuid.uuid4().hex[:12]
+        self.lock_path = self.readers_dir / f"reader-{os.getpid()}-{rid}.lock"
+        self.fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self._write_heartbeat()
+        return None
 
     def acquire(self) -> None:
         deadline = time.monotonic() + self.config.timeout_s
         while True:
-            try:
-                self.fd = os.open(
-                    self.lock_path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
+            blocked_reason = "unknown"
+            with self._state_gate():
+                self._cleanup_orphans_locked()
+                try:
+                    if self.mode == WRITE_MODE:
+                        blocked_reason = self._acquire_write_locked() or ""
+                    else:
+                        blocked_reason = self._acquire_read_locked() or ""
+                except FileExistsError:
+                    blocked_reason = "lock file race, retry"
+
+                if blocked_reason == "":
+                    self._start_heartbeat()
+                    self._register_signal_cleanup()
+                    return
+
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timeout while waiting for {self.mode} lock on GPU{self.physical_device_id}: {blocked_reason} "
+                    f"(>{self.config.timeout_s}s)"
                 )
-                self._write_heartbeat()
-                self._start_heartbeat()
-                self._register_signal_cleanup()
-                return
-            except FileExistsError:
-                self._maybe_cleanup_orphan_lock()
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"Timeout while waiting for GPU benchmark lock: {self.lock_path} (>{self.config.timeout_s}s)"
-                    )
-                time.sleep(max(self.config.poll_ms, 1) / 1000.0)
+            time.sleep(max(self.config.poll_ms, 1) / 1000.0)
 
     def release(self) -> None:
-        if self.fd is None:
+        if self.fd is None or self.lock_path is None:
             return
+
         self._stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=3.0)
+
         try:
             os.close(self.fd)
         except Exception:
             pass
-        self.fd = None
+
         try:
             self.lock_path.unlink()
         except FileNotFoundError:
             pass
+
+        self.fd = None
+        self.lock_path = None
         self._restore_signal_handlers()
 
     def __enter__(self) -> "GpuBenchLock":
@@ -315,15 +452,25 @@ class GpuBenchLock:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    default_mode = os.getenv("GPU_BENCH_LOCK_MODE", WRITE_MODE).strip().lower()
+    if default_mode not in (READ_MODE, WRITE_MODE):
+        default_mode = WRITE_MODE
+
     parser = argparse.ArgumentParser(
         prog="gpulock",
-        description="GPU benchmark lock wrapper: gpulock <gpu_id> \"<command>\"",
+        description="GPU benchmark lock wrapper: gpulock [--mode read|write] <gpu_id> \"<command>\"",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=[WRITE_MODE, READ_MODE],
+        default=default_mode,
+        help="Lock mode. write=exclusive (performance); read=shared (correctness/functional).",
     )
     parser.add_argument("gpu_id", type=int, help="Physical GPU index to lock (nvidia-smi index).")
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
-        help="Command to run. Examples: gpulock 1 \"python bench.py --device 1\" or gpulock 1 -- python bench.py --device 1",
+        help="Command to run. Examples: gpulock --mode write 1 \"python bench.py\" or gpulock --mode read 1 -- python test.py",
     )
     parser.add_argument("--poll-ms", type=int, default=LockConfig.poll_ms)
     parser.add_argument("--timeout-s", type=int, default=LockConfig.timeout_s)
@@ -341,7 +488,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _normalize_command(raw: list[str]) -> tuple[str, bool]:
     if not raw:
-        raise ValueError("Missing command. Usage: gpulock <gpu_id> \"<cmd>\" or gpulock <gpu_id> -- <cmd> [args...]")
+        raise ValueError(
+            "Missing command. Usage: gpulock [--mode read|write] <gpu_id> \"<cmd>\" "
+            "or gpulock [--mode read|write] <gpu_id> -- <cmd> [args...]"
+        )
     if raw[0] == "--":
         raw = raw[1:]
         if not raw:
@@ -365,7 +515,7 @@ def main() -> int:
     )
     command, shell_mode = _normalize_command(args.command)
 
-    lock = GpuBenchLock(args.gpu_id, config=cfg)
+    lock = GpuBenchLock(args.gpu_id, mode=args.mode, config=cfg)
     try:
         lock.acquire()
     except TimeoutError as e:
@@ -375,10 +525,15 @@ def main() -> int:
         print(f"[GPU Lock] acquire failed: {e}", file=sys.stderr)
         return 1
 
-    print(f"[GPU Lock] acquired device={lock.physical_device_id} lock_path={lock.lock_path}")
+    path_str = str(lock.lock_path) if lock.lock_path is not None else ""
+    print(
+        f"[GPU Lock] acquired mode={lock.mode} device={lock.physical_device_id} lock_path={path_str}",
+        flush=True,
+    )
 
     child_env = os.environ.copy()
     child_env["GPU_BENCH_LOCKED_DEVICE"] = str(lock.physical_device_id)
+    child_env["GPU_BENCH_LOCK_MODE"] = lock.mode
     if args.set_cuda_visible_devices:
         child_env["CUDA_VISIBLE_DEVICES"] = str(lock.physical_device_id)
 
@@ -388,7 +543,10 @@ def main() -> int:
         rc = 130
     finally:
         lock.release()
-        print(f"[GPU Lock] released device={lock.physical_device_id} lock_path={lock.lock_path}")
+        print(
+            f"[GPU Lock] released mode={lock.mode} device={lock.physical_device_id}",
+            flush=True,
+        )
 
     return int(rc)
 

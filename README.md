@@ -4,7 +4,7 @@
 
 它不依赖 benchmark 程序内部改造，通过外层包装实现：
 
-- GPU 文件锁（每张卡一个锁文件）
+- GPU 读写锁（每张卡一套锁状态）
 - 原子创建（`O_CREAT|O_EXCL`）
 - 已有锁时自旋等待 + 超时
 - 心跳刷新
@@ -14,16 +14,25 @@
 ## 用法
 
 ```bash
-./gpulock <gpu_id> "原本命令"
+./gpulock --mode write <gpu_id> "原本命令"
 # 或
-./gpulock <gpu_id> -- 原本命令 参数1 参数2
+./gpulock --mode read <gpu_id> -- 原本命令 参数1 参数2
 ```
 
 例子：
 
 ```bash
-./gpulock 1 "CUDA_VISIBLE_DEVICES=1 ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10"
+./gpulock --mode write 1 "CUDA_VISIBLE_DEVICES=1 ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10"
+./gpulock --mode read 1 -- /opt/base/bin/python tests/topk_correctness.py
 ```
+
+## 读写锁语义
+
+- `--mode write`（性能测试）：写锁，完全互斥
+  - 不允许任何其他 `write` 或 `read` 共存
+- `--mode read`（正确性/功能测试）：读锁，可并发
+  - 多个 `read` 可以共存
+  - 与 `write` 互斥
 
 ## 全局安装
 
