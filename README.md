@@ -22,8 +22,8 @@
 例子：
 
 ```bash
-./gpulock perf 1 -- ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10
-./gpulock check 1 -- /opt/base/bin/python tests/topk_correctness.py
+./gpulock perf 1 -- ./build/operator_benchmark --case matmul_fp16 --size 4096
+./gpulock check 1 -- /opt/base/bin/python tests/operator_correctness.py
 ```
 
 ## 读写锁语义
