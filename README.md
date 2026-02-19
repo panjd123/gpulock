@@ -25,6 +25,13 @@
 ./gpulock 1 "CUDA_VISIBLE_DEVICES=1 ./build/topk_bench --rows 1 --cols 512 --small-k 10 --large-k 10"
 ```
 
+## 全局安装
+
+```bash
+./install.sh
+gpulock --help
+```
+
 ## 锁目录
 
 按以下顺序选择：
