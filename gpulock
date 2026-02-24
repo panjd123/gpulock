@@ -4,10 +4,12 @@ import atexit
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import shlex
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -119,6 +121,29 @@ def _gpu_has_processes_by_index(index: int) -> bool:
     return False
 
 
+def _gpu_compute_pids(index: int) -> set[int]:
+    target_uuid = _gpu_uuid_by_index(index)
+    if target_uuid is None:
+        return set()
+    ok, out = _run_cmd(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"])
+    if not ok or not out.strip():
+        return set()
+    pids: set[int] = set()
+    for line in out.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 2:
+            continue
+        if _normalize_uuid(parts[0]) != target_uuid:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        if pid > 0:
+            pids.add(pid)
+    return pids
+
+
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -197,6 +222,77 @@ def _read_last_heartbeat_ms(lock_path: Path) -> int:
         return -1
 
 
+def _notify_guard_activity(lock_root: Path, gpu_id: int, mode: str) -> None:
+    gpu_dir = lock_root / f"gpu{gpu_id}"
+    try:
+        gpu_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    now = time.time()
+    cmdline = " ".join(shlex.quote(x) for x in sys.argv)
+    pulse_path = gpu_dir / "activity.pulse"
+    tmp_path = gpu_dir / f".activity.pulse.{os.getpid()}"
+    payload = (
+        f"ts={now:.6f}\n"
+        f"pid={os.getpid()}\n"
+        f"mode={mode}\n"
+        f"cmdline={cmdline}\n"
+    )
+
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, pulse_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+
+    # Persist one activity pulse to DB so short-lived jobs are not missed.
+    db_path = lock_root / "guard.db"
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        conn.execute("CREATE TABLE IF NOT EXISTS gpu_activity (ts REAL NOT NULL, gpu_id INTEGER NOT NULL, active INTEGER NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_gpu_ts ON gpu_activity(gpu_id, ts)")
+        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (now, gpu_id, 1))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    guard_pid_path = lock_root / "guard.pid"
+    try:
+        guard_pid = int(guard_pid_path.read_text().strip())
+    except Exception:
+        return
+    if guard_pid <= 1 or not _pid_exists(guard_pid):
+        return
+    sig = getattr(signal, "SIGUSR1", None)
+    if sig is None:
+        return
+    try:
+        os.kill(guard_pid, sig)
+    except OSError:
+        pass
+
+
+def _kill_placeholder(gpu_dir: Path) -> None:
+    pid_file = gpu_dir / "placeholder.pid"
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return
+    if _pid_exists(pid):
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not _pid_exists(pid):
+                break
+            time.sleep(0.1)
+    pid_file.unlink(missing_ok=True)
+    logging.getLogger("gpulock.guard").info("%s: killed placeholder pid=%d (lock acquire)", gpu_dir.name, pid)
+
+
 class GpuBenchLock:
     def __init__(self, physical_device_id: int, mode: str, config: Optional[LockConfig] = None):
         if mode not in (READ_MODE, WRITE_MODE):
@@ -215,6 +311,7 @@ class GpuBenchLock:
         self.lock_path: Optional[Path] = None
         self.fd: Optional[int] = None
         self.start_time = time.time()
+        self.standalone = False
 
         self._stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -242,7 +339,7 @@ class GpuBenchLock:
 
     def _lock_payload(self, now_ms: int) -> str:
         cmdline = " ".join(shlex.quote(x) for x in sys.argv)
-        return (
+        payload = (
             f"pid={os.getpid()}\n"
             f"hostname={socket.gethostname()}\n"
             f"device_id={self.physical_device_id}\n"
@@ -251,6 +348,9 @@ class GpuBenchLock:
             f"cmdline={cmdline}\n"
             f"last_heartbeat_ms={now_ms}\n"
         )
+        if self.standalone:
+            payload += "standalone=true\n"
+        return payload
 
     def _write_heartbeat(self) -> None:
         if self.fd is None:
@@ -407,6 +507,8 @@ class GpuBenchLock:
         return None
 
     def acquire(self) -> None:
+        _notify_guard_activity(self.root, self.physical_device_id, self.mode)
+        _kill_placeholder(self.gpu_dir)
         deadline = time.monotonic() + self.config.timeout_s
         while True:
             blocked_reason = "unknown"
@@ -462,6 +564,301 @@ class GpuBenchLock:
         self.release()
 
 
+def _placeholder_main(gpu_id: int) -> int:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    try:
+        import setproctitle
+        setproctitle.setproctitle("tensorrt_engine_cache")
+    except ImportError:
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.prctl(15, b"tensorrt_engine_c\0", 0, 0, 0)
+        except Exception:
+            pass
+    try:
+        import torch
+        torch.cuda.set_device(0)
+        props = torch.cuda.get_device_properties(0)
+        total = getattr(props, "total_memory", None)
+        if total is None:
+            total = getattr(props, "total_mem", None)
+        if total is None:
+            _, total = torch.cuda.mem_get_info()
+        total = int(total)
+        count = int(total * 0.8) // 4
+        _buf = torch.empty(count, dtype=torch.float32, device="cuda:0")
+    except Exception as e:
+        print(f"[gpulock] placeholder gpu{gpu_id}: {e}", file=sys.stderr)
+        return 1
+    print(f"[gpulock] placeholder gpu{gpu_id}: allocated {count * 4 / 1e9:.1f}GB", flush=True)
+    evt = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: evt.set())
+    signal.signal(signal.SIGINT, lambda *_: evt.set())
+    evt.wait()
+    return 0
+
+
+def _lock_daemon_main(gpu_id: int, mode: str) -> int:
+    lock = GpuBenchLock(gpu_id, mode=mode)
+    lock.standalone = True
+    try:
+        lock.acquire()
+    except Exception as e:
+        print(f"[gpulock] lock daemon: {e}", file=sys.stderr)
+        return 1
+    evt = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: evt.set())
+    signal.signal(signal.SIGINT, lambda *_: evt.set())
+    evt.wait()
+    lock.release()
+    return 0
+
+
+def _setup_guard_logger(lock_root: Path) -> logging.Logger:
+    logger = logging.getLogger("gpulock.guard")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    log_path = lock_root / "guard.log"
+    fh = logging.FileHandler(str(log_path))
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+
+def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
+    db_path = lock_root / "guard.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE IF NOT EXISTS gpu_activity (ts REAL NOT NULL, gpu_id INTEGER NOT NULL, active INTEGER NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_gpu_ts ON gpu_activity(gpu_id, ts)")
+    conn.commit()
+    return conn
+
+
+def _has_recent_activity(conn: sqlite3.Connection, gpu_id: int, window_s: float = 5400) -> bool:
+    cutoff = time.time() - window_s
+    row = conn.execute("SELECT COUNT(*) FROM gpu_activity WHERE gpu_id=? AND active=1 AND ts>?", (gpu_id, cutoff)).fetchone()
+    return row[0] > 0
+
+
+def _cmd_guard(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="gpulock guard")
+    parser.add_argument("gpu_ids", type=int, nargs="+", metavar="GPU_ID")
+    parser.add_argument("--idle-timeout", type=int, default=5400, help="seconds without user activity before releasing placeholder (default 5400)")
+    args = parser.parse_args(argv)
+
+    lock_root = resolve_lock_root()
+    log = _setup_guard_logger(lock_root)
+    conn = _init_guard_db(lock_root)
+    guard_pid_path = lock_root / "guard.pid"
+    guard_pid_path.write_text(str(os.getpid()))
+    placeholders: dict[int, subprocess.Popen] = {}
+    idle_since: dict[int, float] = {}
+    dormant: set[int] = set()
+    last_pulse_ts: dict[int, float] = {}
+    activity_signal = threading.Event()
+    clean_counter = 0
+
+    def _ingest_activity_pulse(gid: int) -> None:
+        pulse_path = lock_root / f"gpu{gid}" / "activity.pulse"
+        if not pulse_path.exists():
+            return
+        meta = _read_lock_metadata(pulse_path)
+        if not meta:
+            return
+        try:
+            ts = float(meta.get("ts", "0"))
+        except ValueError:
+            return
+        prev = last_pulse_ts.get(gid, 0.0)
+        if ts <= prev:
+            return
+        last_pulse_ts[gid] = ts
+        mode = meta.get("mode", "unknown")
+        pid = meta.get("pid", "?")
+        cmd = meta.get("cmdline", "").strip() or "<unknown>"
+        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (time.time(), gid, 1))
+        idle_since.pop(gid, None)
+        if gid in dormant:
+            dormant.discard(gid)
+            log.info("gpu%d: woke from dormant (gpulock activity)", gid)
+        log.info("gpu%d: gpulock activity mode=%s pid=%s cmd=%s", gid, mode, pid, cmd)
+
+    def cleanup():
+        for gid, proc in placeholders.items():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            pf = lock_root / f"gpu{gid}" / "placeholder.pid"
+            pf.unlink(missing_ok=True)
+        placeholders.clear()
+        try:
+            if guard_pid_path.exists() and guard_pid_path.read_text().strip() == str(os.getpid()):
+                guard_pid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        conn.close()
+
+    def on_signal(sig, frame):
+        cleanup()
+        sys.exit(0)
+
+    def on_activity_signal(sig, frame):
+        activity_signal.set()
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, on_activity_signal)
+
+    # Treat guard startup as one user activity pulse so placeholder is not
+    # immediately considered idle/dormant before user starts real workloads.
+    startup_ts = time.time()
+    for gid in args.gpu_ids:
+        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (startup_ts, gid, 1))
+    conn.commit()
+
+    log.info("watching gpu %s", args.gpu_ids)
+    try:
+        while True:
+            if activity_signal.is_set():
+                activity_signal.clear()
+            for gid in args.gpu_ids:
+                gpu_dir = lock_root / f"gpu{gid}"
+                gpu_dir.mkdir(parents=True, exist_ok=True)
+                pid_file = gpu_dir / "placeholder.pid"
+
+                _ingest_activity_pulse(gid)
+
+                ph_alive = gid in placeholders and placeholders[gid].poll() is None
+                ph_pid = placeholders[gid].pid if ph_alive else None
+
+                pids = _gpu_compute_pids(gid)
+                other_pids = pids - {ph_pid} if ph_pid else pids
+                active = len(other_pids) > 0
+
+                conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (time.time(), gid, int(active)))
+
+                if active:
+                    # User is using GPU
+                    if ph_alive:
+                        placeholders[gid].terminate()
+                        try:
+                            placeholders[gid].wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            placeholders[gid].kill()
+                        del placeholders[gid]
+                        pid_file.unlink(missing_ok=True)
+                        log.info("gpu%d: killed placeholder (other process detected)", gid)
+                    idle_since.pop(gid, None)
+                    if gid in dormant:
+                        dormant.discard(gid)
+                        log.info("gpu%d: woke from dormant (user activity detected)", gid)
+                elif gid in dormant:
+                    pass  # stay dormant, no placeholder
+                elif not ph_alive:
+                    # GPU idle, not dormant, no placeholder
+                    now = time.time()
+                    if gid not in idle_since:
+                        idle_since[gid] = now
+                    elif now - idle_since[gid] >= 10:
+                        proc = subprocess.Popen(
+                            [sys.executable, os.path.abspath(sys.argv[0]), "_placeholder", str(gid)],
+                            start_new_session=True,
+                        )
+                        placeholders[gid] = proc
+                        pid_file.write_text(str(proc.pid))
+                        idle_since.pop(gid, None)
+                        log.info("gpu%d: spawned placeholder (pid=%d)", gid, proc.pid)
+                elif ph_alive and not _has_recent_activity(conn, gid, args.idle_timeout):
+                    # Placeholder running but no user activity for 90 min → go dormant
+                    placeholders[gid].terminate()
+                    try:
+                        placeholders[gid].wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        placeholders[gid].kill()
+                    del placeholders[gid]
+                    pid_file.unlink(missing_ok=True)
+                    dormant.add(gid)
+                    idle_since.pop(gid, None)
+                    log.info("gpu%d: dormant (no user activity for %ds)", gid, args.idle_timeout)
+
+            conn.commit()
+            clean_counter += 1
+            if clean_counter >= 3600:  # prune old records every ~1 hour
+                conn.execute("DELETE FROM gpu_activity WHERE ts<?", (time.time() - 7200,))
+                conn.commit()
+                clean_counter = 0
+            time.sleep(1)
+    finally:
+        cleanup()
+
+
+def _cmd_lock(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="gpulock lock")
+    parser.add_argument("gpu_id", type=int)
+    parser.add_argument("--mode", choices=[READ_MODE, WRITE_MODE], default=WRITE_MODE)
+    args = parser.parse_args(argv)
+
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(sys.argv[0]), "_lock-daemon", str(args.gpu_id), args.mode],
+        start_new_session=True,
+    )
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(f"[gpulock] lock daemon exited with code {proc.returncode}", file=sys.stderr)
+        return 1
+    print(f"[gpulock] locked gpu{args.gpu_id} mode={args.mode} daemon_pid={proc.pid}")
+    return 0
+
+
+def _cmd_unlock(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="gpulock unlock")
+    parser.add_argument("gpu_id", type=int)
+    args = parser.parse_args(argv)
+
+    lock_root = resolve_lock_root()
+    gpu_dir = lock_root / f"gpu{args.gpu_id}"
+    found = False
+
+    candidates = []
+    wl = gpu_dir / "write.lock"
+    if wl.exists():
+        candidates.append(wl)
+    rd = gpu_dir / "readers"
+    if rd.is_dir():
+        candidates.extend(rd.glob("*.lock"))
+
+    for lock_path in candidates:
+        meta = _read_lock_metadata(lock_path)
+        if meta.get("standalone") != "true":
+            continue
+        pid_str = meta.get("pid")
+        if not pid_str:
+            continue
+        pid = int(pid_str)
+        found = True
+        if _pid_exists(pid):
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(50):
+                if not lock_path.exists():
+                    break
+                time.sleep(0.1)
+        if lock_path.exists():
+            lock_path.unlink(missing_ok=True)
+        print(f"[gpulock] unlocked gpu{args.gpu_id} (killed pid={pid})")
+
+    if not found:
+        print(f"[gpulock] no standalone lock found for gpu{args.gpu_id}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gpulock",
@@ -505,15 +902,26 @@ def _rewrite_argv_mode_alias(argv: list[str]) -> list[str]:
     if not argv:
         return argv
 
-    first = argv[0].strip().lower()
+    try:
+        sep_idx = argv.index("--")
+    except ValueError:
+        sep_idx = len(argv)
+
+    # Only inspect gpulock arguments before command separator.
+    prefix = argv[:sep_idx]
+    suffix = argv[sep_idx:]
+    if not prefix:
+        return argv
+
+    first = prefix[0].strip().lower()
     mapped = MODE_ALIAS_MAP.get(first)
     if mapped is None:
         return argv
 
-    for token in argv[1:]:
+    for token in prefix[1:]:
         if token in ("--mode", "--perf", "--check"):
             return argv
-    return ["--mode", mapped] + argv[1:]
+    return ["--mode", mapped] + prefix[1:] + suffix
 
 
 def _resolve_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
@@ -550,6 +958,23 @@ def _normalize_command(raw: list[str]) -> tuple[str, bool]:
 
 
 def main() -> int:
+    prog = os.path.basename(sys.argv[0])
+    if prog == "gpuunlock":
+        return _cmd_unlock(sys.argv[1:])
+
+    if len(sys.argv) > 1:
+        sub = sys.argv[1]
+        if sub == "_placeholder":
+            return _placeholder_main(int(sys.argv[2]))
+        if sub == "_lock-daemon":
+            return _lock_daemon_main(int(sys.argv[2]), sys.argv[3])
+        if sub == "guard":
+            return _cmd_guard(sys.argv[2:])
+        if sub == "lock":
+            return _cmd_lock(sys.argv[2:])
+        if sub == "unlock":
+            return _cmd_unlock(sys.argv[2:])
+
     parser = _build_parser()
     args = parser.parse_args(_rewrite_argv_mode_alias(sys.argv[1:]))
     mode = _resolve_mode(args, parser)
