@@ -13,3 +13,7 @@ fi
 ln -sfn "${SRC}" "${DST}"
 chmod +x "${SRC}"
 echo "installed: ${DST} -> ${SRC}"
+
+UNLOCK_DST="/usr/local/bin/gpuunlock"
+ln -sfn "${SRC}" "${UNLOCK_DST}"
+echo "installed: ${UNLOCK_DST} -> ${SRC}"
