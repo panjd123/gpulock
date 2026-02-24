@@ -564,7 +564,7 @@ class GpuBenchLock:
         self.release()
 
 
-def _placeholder_main(gpu_id: int) -> int:
+def _placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     try:
         import setproctitle
@@ -595,7 +595,25 @@ def _placeholder_main(gpu_id: int) -> int:
     evt = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: evt.set())
     signal.signal(signal.SIGINT, lambda *_: evt.set())
-    evt.wait()
+
+    if keep_util:
+        # Keep a tiny compute stream alive so nvidia-smi util stays non-zero.
+        try:
+            load_dim = 1024
+            load_a = torch.randn((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
+            load_b = torch.randn((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
+            load_c = torch.empty((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
+            print(f"[gpulock] placeholder gpu{gpu_id}: low-duty compute enabled", flush=True)
+            while not evt.is_set():
+                for _ in range(8):
+                    torch.mm(load_a, load_b, out=load_c)
+                torch.cuda.synchronize()
+                evt.wait(0.05)
+        except Exception as e:
+            print(f"[gpulock] placeholder gpu{gpu_id}: load loop disabled ({e})", file=sys.stderr)
+            evt.wait()
+    else:
+        evt.wait()
     return 0
 
 
@@ -648,6 +666,19 @@ def _cmd_guard(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="gpulock guard")
     parser.add_argument("gpu_ids", type=int, nargs="+", metavar="GPU_ID")
     parser.add_argument("--idle-timeout", type=int, default=5400, help="seconds without user activity before releasing placeholder (default 5400)")
+    parser.add_argument(
+        "--placeholder-load",
+        dest="placeholder_load",
+        action="store_true",
+        default=True,
+        help="keep a lightweight compute loop in placeholder so GPU util stays non-zero (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-placeholder-load",
+        dest="placeholder_load",
+        action="store_false",
+        help="disable placeholder compute loop and only reserve memory",
+    )
     args = parser.parse_args(argv)
 
     lock_root = resolve_lock_root()
@@ -723,7 +754,7 @@ def _cmd_guard(argv: list[str]) -> int:
         conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (startup_ts, gid, 1))
     conn.commit()
 
-    log.info("watching gpu %s", args.gpu_ids)
+    log.info("watching gpu %s (placeholder_load=%s)", args.gpu_ids, "on" if args.placeholder_load else "off")
     try:
         while True:
             if activity_signal.is_set():
@@ -768,7 +799,13 @@ def _cmd_guard(argv: list[str]) -> int:
                         idle_since[gid] = now
                     elif now - idle_since[gid] >= 10:
                         proc = subprocess.Popen(
-                            [sys.executable, os.path.abspath(sys.argv[0]), "_placeholder", str(gid)],
+                            [
+                                sys.executable,
+                                os.path.abspath(sys.argv[0]),
+                                "_placeholder",
+                                str(gid),
+                                "1" if args.placeholder_load else "0",
+                            ],
                             start_new_session=True,
                         )
                         placeholders[gid] = proc
@@ -965,7 +1002,10 @@ def main() -> int:
     if len(sys.argv) > 1:
         sub = sys.argv[1]
         if sub == "_placeholder":
-            return _placeholder_main(int(sys.argv[2]))
+            keep_util = True
+            if len(sys.argv) > 3:
+                keep_util = sys.argv[3].strip().lower() not in ("0", "false", "no", "off")
+            return _placeholder_main(int(sys.argv[2]), keep_util=keep_util)
         if sub == "_lock-daemon":
             return _lock_daemon_main(int(sys.argv[2]), sys.argv[3])
         if sub == "guard":

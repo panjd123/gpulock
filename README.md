@@ -49,11 +49,13 @@ gpulock check 1 -- /opt/base/bin/python tests/operator_correctness.py
 ```bash
 gpulock guard 0 1 2
 gpulock guard 0 --idle-timeout 3600
+gpulock guard 0 --no-placeholder-load
 ```
 
 监控指定 GPU，闲时自动占用 80% 显存防止他人抢占：
 
 - 每秒轮询 `nvidia-smi`，GPU 空闲 10 秒后自动分配显存（占位进程伪装为 `tensorrt_engine_cache`）
+- 占位进程默认开启轻量计算负载，让 `gpu util` 持续非 0（可用 `--no-placeholder-load` 关闭）
 - 检测到用户进程时自动释放占位，不影响正常使用
 - `gpulock perf/check/lock` 获取锁时也会自动清除占位进程
 - `gpulock perf/check/lock` 调用会写入 activity pulse；guard 会记录为一次用户活动，并在日志打印触发命令（可覆盖 `<1s` 短任务）
