@@ -1,50 +1,68 @@
-"""Built-in supervisor backend for environments without systemd.
+"""supervisord backend for the gpulock guard service.
 
-This module implements two flavours of operation:
+Wraps the third-party ``supervisor`` package. All state lives under
+``${lock_root}/service/``:
 
-* The user-facing actions (``install``, ``start``, ``stop``, ``status``,
-  ``logs``, ...). These are short-lived commands that manage a separate,
-  daemonised supervisor process.
-* The supervisor process itself, entered via
-  ``gpulock service _run-supervisor``. It double-forks to detach from the
-  controlling terminal, then loops forever spawning ``gpulock guard`` as a
-  child and restarting it (with backoff) on crash.
+* ``config.json``       gpulock-managed runtime config (see common.py)
+* ``supervisord.conf``  generated; rewritten on every ``service start/restart``
+* ``supervisord.pid``   supervisord's own pid file
+* ``supervisord.log``   supervisord's own log
+* ``supervisor.sock``   unix domain socket for supervisorctl
+* ``guard.log``         combined stdout+stderr of ``gpulock guard``
 """
 
 from __future__ import annotations
 
 import contextlib
-import errno
-import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from ..gpu import pid_exists
-from ..paths import resolve_lock_root
-from .common import GuardServiceConfig, service_dir
+from .common import GuardServiceConfig, chmod_quiet, say, service_dir, warn
 
 
-SUPERVISOR_PID_FILENAME = "supervisor.pid"
-GUARD_PID_FILENAME = "service-guard.pid"
-SUPERVISOR_LOG_FILENAME = "supervisor.log"
+PROGRAM_NAME = "gpulock-guard"
+CONF_FILENAME = "supervisord.conf"
+PID_FILENAME = "supervisord.pid"
+SOCK_FILENAME = "supervisor.sock"
+SUPERVISORD_LOG_FILENAME = "supervisord.log"
+GUARD_LOG_FILENAME = "guard.log"
+
+# Always invoke supervisord/supervisorctl through the same interpreter that
+# imports gpulock, so we hit the gpulock-managed venv even when the user has
+# multiple Pythons in PATH.
+_SUPERVISORD = [sys.executable, "-m", "supervisor.supervisord"]
+_SUPERVISORCTL = [sys.executable, "-m", "supervisor.supervisorctl"]
 
 
-def supervisor_pid_path(lock_root: Path | None = None) -> Path:
-    return service_dir(lock_root) / SUPERVISOR_PID_FILENAME
+# --- paths ---------------------------------------------------------------
+
+def conf_path(lock_root: Path | None = None) -> Path:
+    return service_dir(lock_root) / CONF_FILENAME
 
 
-def guard_pid_path(lock_root: Path | None = None) -> Path:
-    return service_dir(lock_root) / GUARD_PID_FILENAME
+def pid_path(lock_root: Path | None = None) -> Path:
+    return service_dir(lock_root) / PID_FILENAME
 
 
-def supervisor_log_path(lock_root: Path | None = None) -> Path:
-    return service_dir(lock_root) / SUPERVISOR_LOG_FILENAME
+def sock_path(lock_root: Path | None = None) -> Path:
+    return service_dir(lock_root) / SOCK_FILENAME
 
+
+def supervisord_log_path(lock_root: Path | None = None) -> Path:
+    return service_dir(lock_root) / SUPERVISORD_LOG_FILENAME
+
+
+def guard_log_path(lock_root: Path | None = None) -> Path:
+    return service_dir(lock_root) / GUARD_LOG_FILENAME
+
+
+# --- low-level state queries ---------------------------------------------
 
 def _read_pid(path: Path) -> int:
     try:
@@ -52,336 +70,279 @@ def _read_pid(path: Path) -> int:
     except OSError:
         return 0
     try:
-        return int(raw)
+        return max(int(raw or 0), 0)
     except ValueError:
         return 0
 
 
-def supervisor_running(lock_root: Path | None = None) -> tuple[bool, int]:
-    pid = _read_pid(supervisor_pid_path(lock_root))
-    if pid <= 0:
-        return (False, 0)
-    return (pid_exists(pid), pid)
+def running_pid(lock_root: Path | None = None) -> int:
+    """Return supervisord's pid if alive, else 0."""
+    pid = _read_pid(pid_path(lock_root))
+    return pid if pid > 0 and pid_exists(pid) else 0
 
 
-# ---------------------------------------------------------------------------
-# Public actions
-# ---------------------------------------------------------------------------
-
-def install(cfg: GuardServiceConfig, *, start_now: bool = True) -> Path:
-    cfg.save()  # config persisted by caller usually, but keep it idempotent
-    if start_now:
-        start()
-    return service_dir() / "config.json"
+def supervisor_available() -> tuple[bool, str]:
+    """Check that the third-party `supervisor` package is importable."""
+    try:
+        import supervisor  # noqa: F401
+    except ImportError as e:
+        return (False, str(e))
+    return (True, "")
 
 
-def uninstall() -> None:
-    stop()
-    cfg_path = service_dir() / "config.json"
-    cfg_path.unlink(missing_ok=True)
+def _cleanup_stale() -> None:
+    pid_path().unlink(missing_ok=True)
+    sock_path().unlink(missing_ok=True)
+
+
+# --- conf rendering ------------------------------------------------------
+
+def _format_environment(env: dict[str, str]) -> str:
+    """Format an env dict for supervisord's ``environment=KEY="VAL",...`` syntax.
+
+    Raises ``ValueError`` if a value contains a character that supervisord's
+    quoting cannot represent (double quote / newline).
+    """
+    parts: list[str] = []
+    for k, v in env.items():
+        if any(c in v for c in ('"', "\n", "\r")):
+            raise ValueError(
+                f"extra_env value for {k!r} contains an unsupported character "
+                "(double-quote or newline). edit supervisord.conf manually if you "
+                "really need this."
+            )
+        parts.append(f'{k}="{v}"')
+    return ",".join(parts)
+
+
+def _build_program_command(cfg: GuardServiceConfig) -> str:
+    binary = cfg.gpulock_executable.strip()
+    if binary:
+        argv = [binary, *cfg.to_guard_argv()]
+    else:
+        python = cfg.python_executable.strip() or sys.executable
+        argv = [python, "-m", "gpulock", *cfg.to_guard_argv()]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def render_conf(cfg: GuardServiceConfig) -> str:
+    """Render the supervisord.conf body.
+
+    Uses ``%(here)s`` everywhere so the file is location-independent: the
+    service directory can be moved or symlinked without touching the conf.
+    """
+    cmd = _build_program_command(cfg)
+    env_line = _format_environment(cfg.extra_env)
+    env_section = f"environment={env_line}\n" if env_line else ""
+    return f"""\
+; gpulock-managed supervisord config. regenerated on every `service start/restart`.
+; do NOT edit by hand; use `gpulock service config ...` instead.
+
+[unix_http_server]
+file=%(here)s/{SOCK_FILENAME}
+chmod=0700
+
+[supervisord]
+logfile=%(here)s/{SUPERVISORD_LOG_FILENAME}
+logfile_maxbytes=20MB
+logfile_backups=5
+pidfile=%(here)s/{PID_FILENAME}
+nodaemon=false
+silent=false
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://%(here)s/{SOCK_FILENAME}
+
+[program:{PROGRAM_NAME}]
+command={cmd}
+autostart=true
+autorestart=true
+startsecs=3
+startretries=10
+stopwaitsecs=10
+stopsignal=TERM
+killasgroup=true
+stopasgroup=true
+redirect_stderr=true
+stdout_logfile=%(here)s/{GUARD_LOG_FILENAME}
+stdout_logfile_maxbytes=20MB
+stdout_logfile_backups=5
+{env_section}"""
+
+
+def write_conf(cfg: GuardServiceConfig, lock_root: Path | None = None) -> Path:
+    path = conf_path(lock_root)
+    path.write_text(render_conf(cfg), encoding="utf-8")
+    chmod_quiet(path, 0o600)
+    return path
+
+
+# --- supervisorctl plumbing ----------------------------------------------
+
+def _supervisorctl(*args: str, timeout_s: float = 30.0) -> tuple[int, str, str]:
+    cmd = [*_SUPERVISORCTL, "-c", str(conf_path()), *args]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except FileNotFoundError as e:
+        return (127, "", f"supervisorctl not available: {e}\n")
+    return (proc.returncode, proc.stdout, proc.stderr)
+
+
+# --- user-facing actions -------------------------------------------------
+
+def install(cfg: GuardServiceConfig, *, start_now: bool) -> int:
+    cfg.save()
+    write_conf(cfg)
+    return start() if start_now else 0
 
 
 def start() -> int:
-    """Spawn the supervisor as a detached background process."""
-    running, pid = supervisor_running()
-    if running:
-        print(f"[gpulock service] supervisor already running (pid={pid})")
-        return 0
-
-    # Stale PID file -> remove.
-    supervisor_pid_path().unlink(missing_ok=True)
-
-    python = sys.executable or "python3"
-    cmd = [python, "-m", "gpulock", "service", "_run-supervisor"]
-    log_path = supervisor_log_path()
-    log_path.touch(exist_ok=True)
-    try:
-        os.chmod(log_path, 0o600)
-    except PermissionError:
-        pass
-
-    log_fp = open(log_path, "ab", buffering=0)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_fp,
-            stderr=log_fp,
-            close_fds=True,
-            start_new_session=True,
+    """Launch supervisord in the background. Idempotent."""
+    ok, err = supervisor_available()
+    if not ok:
+        warn(
+            f"supervisor package not importable: {err}\n"
+            "  reinstall gpulock to pull in the dependency:\n"
+            "    uv tool install . --force   # or: pip install --user ."
         )
-    finally:
-        log_fp.close()
+        return 1
 
-    # Wait briefly for the supervisor to write its PID file.
+    if pid := running_pid():
+        say(f"supervisord already running (pid={pid})")
+        return 0
+    _cleanup_stale()
+
+    try:
+        cfg = GuardServiceConfig.load()
+    except FileNotFoundError as e:
+        warn(str(e))
+        return 1
+    try:
+        write_conf(cfg)
+    except ValueError as e:
+        warn(str(e))
+        return 2
+
+    cmd = [*_SUPERVISORD, "-c", str(conf_path())]
+    try:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        warn("supervisord did not daemonize within 15s")
+        return 1
+    if proc.returncode != 0:
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        running, pid = supervisor_running()
-        if running:
-            print(f"[gpulock service] supervisor started (pid={pid}, log={log_path})")
+        if pid := running_pid():
+            say(f"supervisord started (pid={pid}, conf={conf_path()})")
             return 0
-        if proc.poll() is not None:
-            print(
-                "[gpulock service] supervisor exited immediately. "
-                f"check {log_path} for details.",
-                file=sys.stderr,
-            )
-            return proc.returncode or 1
         time.sleep(0.1)
-    print(
-        "[gpulock service] supervisor did not write a PID file in time; "
-        f"check {log_path}.",
-        file=sys.stderr,
-    )
+
+    warn(f"supervisord did not write a pid file in time; check {supervisord_log_path()}.")
     return 1
 
 
-def stop(timeout_s: float = 15.0) -> int:
-    running, pid = supervisor_running()
-    if not running:
-        supervisor_pid_path().unlink(missing_ok=True)
-        guard_pid_path().unlink(missing_ok=True)
-        print("[gpulock service] supervisor not running")
+def stop(timeout_s: float = 30.0) -> int:
+    pid = running_pid()
+    if pid == 0:
+        _cleanup_stale()
+        say("supervisord not running")
         return 0
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        if e.errno == errno.ESRCH:
-            supervisor_pid_path().unlink(missing_ok=True)
-            return 0
-        print(f"[gpulock service] failed to signal supervisor pid={pid}: {e}", file=sys.stderr)
-        return 1
+    rc, out, err = _supervisorctl("shutdown", timeout_s=timeout_s)
+    if out.strip():
+        print(out.strip())
+    if rc != 0 and err.strip():
+        print(err.strip(), file=sys.stderr)
 
     deadline = time.monotonic() + max(timeout_s, 1.0)
     while time.monotonic() < deadline:
         if not pid_exists(pid):
-            supervisor_pid_path().unlink(missing_ok=True)
-            guard_pid_path().unlink(missing_ok=True)
-            print(f"[gpulock service] supervisor stopped (pid={pid})")
+            _cleanup_stale()
+            say(f"supervisord stopped (pid={pid})")
             return 0
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    time.sleep(0.5)
+    with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGKILL)
-    supervisor_pid_path().unlink(missing_ok=True)
-    guard_pid_path().unlink(missing_ok=True)
-    print(f"[gpulock service] supervisor force-killed (pid={pid})", file=sys.stderr)
+    _cleanup_stale()
+    warn(f"supervisord force-killed (pid={pid})")
     return 0
 
 
 def restart() -> int:
-    stop()
-    return start()
+    rc = stop()
+    return rc if rc != 0 else start()
 
 
 def status() -> int:
-    running, sup_pid = supervisor_running()
-    guard_pid = _read_pid(guard_pid_path())
-    guard_alive = guard_pid > 0 and pid_exists(guard_pid)
-    print(f"backend: supervisor")
-    print(f"supervisor: {'running' if running else 'stopped'} (pid={sup_pid or '-'})")
-    print(f"guard:      {'running' if guard_alive else 'stopped'} (pid={guard_pid or '-'})")
-    log_path = supervisor_log_path()
-    if log_path.exists():
-        try:
-            size = log_path.stat().st_size
-        except OSError:
-            size = 0
-        print(f"log:        {log_path} ({size} bytes)")
-    return 0 if running and guard_alive else 3
+    """Print high-level status. Exit codes follow the LSB / systemd convention:
+
+    * 0 — installed and supervisord+guard running healthily
+    * 3 — installed, supervisord stopped (or guard not RUNNING)
+    * 4 — not installed (no config.json)
+    """
+    cfg_path = GuardServiceConfig.config_path()
+    if not cfg_path.exists():
+        print(f"installed:    no  (missing config: {cfg_path})")
+        print("next:         ./install.sh   # or: gpulock service install --no-start")
+        return 4
+
+    cfg = GuardServiceConfig.load()
+    pid = running_pid()
+    print(f"installed:    yes")
+    print(f"config:       {cfg_path}")
+    print(f"conf:         {conf_path()}")
+    print(f"guard log:    {guard_log_path()}")
+    print(f"gpu_ids:      {cfg.gpu_ids or '<all visible GPUs>'}")
+    print(f"idle_timeout: {cfg.idle_timeout}s")
+    print(f"supervisord:  {'running (pid=' + str(pid) + ')' if pid else 'stopped'}")
+    if pid == 0:
+        return 3
+
+    rc, out, err = _supervisorctl("status", PROGRAM_NAME)
+    if out.strip():
+        for line in out.strip().splitlines():
+            print(f"program:      {line}")
+    if rc != 0 and err.strip():
+        print(err.strip(), file=sys.stderr)
+    return rc
 
 
 def logs(*, lines: int = 200, follow: bool = False) -> int:
-    log_path = supervisor_log_path()
-    if not log_path.exists():
-        print(f"[gpulock service] no supervisor log at {log_path}", file=sys.stderr)
+    log = guard_log_path()
+    if not log.exists():
+        warn(f"no guard log at {log}")
         return 1
-    args = ["tail", "-n", str(max(lines, 1))]
-    if follow:
-        args.append("-F")
-    args.append(str(log_path))
+    n = max(int(lines), 1)
+    cmd = ["tail", "-n", str(n), *(["-F"] if follow else []), str(log)]
     try:
-        return subprocess.call(args)
+        return subprocess.call(cmd)
     except FileNotFoundError:
-        # Fallback: tiny in-Python tail
         try:
-            data = log_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception as e:
-            print(f"[gpulock service] failed to read {log_path}: {e}", file=sys.stderr)
+            data = log.read_text(encoding="utf-8", errors="ignore")
+        except OSError as e:
+            warn(f"failed to read {log}: {e}")
             return 1
-        for line in data.splitlines()[-max(lines, 1):]:
+        for line in data.splitlines()[-n:]:
             print(line)
         return 0
 
 
-# ---------------------------------------------------------------------------
-# Supervisor entry point (long-running)
-# ---------------------------------------------------------------------------
-
-def _setup_supervisor_logger(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger("gpulock.service.supervisor")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    fmt = logging.Formatter(
-        "%(asctime)s %(levelname)s [supervisor] pid=%(process)d %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fh = RotatingFileHandler(str(log_path), maxBytes=20 * 1024 * 1024, backupCount=5)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
-
-
-def _daemonize() -> None:
-    """Standard double-fork to detach from the controlling terminal."""
-    if os.getenv("GPULOCK_SUPERVISOR_FOREGROUND", "").strip().lower() in ("1", "true", "yes", "on"):
-        return
-
-    pid = os.fork()
-    if pid > 0:
-        os._exit(0)
-    os.setsid()
-    pid = os.fork()
-    if pid > 0:
-        os._exit(0)
-
-    os.umask(0o077)
-    try:
-        os.chdir("/")
-    except OSError:
-        pass
-
-    devnull_r = os.open(os.devnull, os.O_RDONLY)
-    devnull_w = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(devnull_r, 0)
-        os.dup2(devnull_w, 1)
-        os.dup2(devnull_w, 2)
-    finally:
-        os.close(devnull_r)
-        os.close(devnull_w)
-
-
-def run_supervisor() -> int:
-    """Long-running entry point: supervises ``gpulock guard``."""
-    lock_root = resolve_lock_root()
-    log = _setup_supervisor_logger(supervisor_log_path(lock_root))
-
-    try:
-        cfg = GuardServiceConfig.load(lock_root)
-    except FileNotFoundError as e:
-        print(f"[gpulock service] {e}", file=sys.stderr)
-        log.error("missing service config: %s", e)
-        return 1
-
-    _daemonize()
-
-    pid_path = supervisor_pid_path(lock_root)
-    pid_path.write_text(str(os.getpid()), encoding="utf-8")
-    try:
-        os.chmod(pid_path, 0o600)
-    except PermissionError:
-        pass
-    log.info("supervisor started; lock_root=%s gpu_ids=%s", lock_root, cfg.gpu_ids)
-
-    stopping = False
-    child: subprocess.Popen | None = None
-
-    def kill_child(sig: int = signal.SIGTERM, *, wait_s: float = 10.0) -> None:
-        nonlocal child
-        if child is None:
-            return
-        if child.poll() is None:
-            with contextlib.suppress(OSError):
-                child.send_signal(sig)
-            try:
-                child.wait(timeout=wait_s)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError):
-                    child.kill()
-                with contextlib.suppress(Exception):
-                    child.wait(timeout=5)
-        guard_pid_path(lock_root).unlink(missing_ok=True)
-        child = None
-
-    def on_term(_sig, _frame):
-        nonlocal stopping
-        stopping = True
-        kill_child(signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, on_term)
-    signal.signal(signal.SIGINT, on_term)
-
-    backoff_s = 1.0
-    backoff_max_s = 60.0
-    try:
-        while not stopping:
-            argv: list[str] = []
-            binary = cfg.gpulock_executable.strip()
-            if binary:
-                argv = [binary, *cfg.to_guard_argv()]
-            else:
-                python = cfg.python_executable.strip() or sys.executable
-                argv = [python, "-m", "gpulock", *cfg.to_guard_argv()]
-
-            log.info("spawning guard: %s", " ".join(argv))
-            env = os.environ.copy()
-            env.update(cfg.extra_env)
-
-            try:
-                child = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=env,
-                    start_new_session=True,
-                )
-            except FileNotFoundError as e:
-                log.error("guard executable missing: %s", e)
-                time.sleep(min(backoff_s, backoff_max_s))
-                backoff_s = min(backoff_s * 2, backoff_max_s)
-                continue
-
-            guard_pid_path(lock_root).write_text(str(child.pid), encoding="utf-8")
-            try:
-                os.chmod(guard_pid_path(lock_root), 0o600)
-            except PermissionError:
-                pass
-            start_ts = time.monotonic()
-
-            rc = None
-            while not stopping:
-                try:
-                    rc = child.wait(timeout=1.0)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-            if stopping:
-                kill_child(signal.SIGTERM)
-                break
-
-            guard_pid_path(lock_root).unlink(missing_ok=True)
-
-            ran_for = time.monotonic() - start_ts
-            log.warning("guard exited rc=%s after %.1fs", rc, ran_for)
-            if ran_for >= 30.0:
-                backoff_s = 1.0
-            sleep_s = min(backoff_s, backoff_max_s)
-            log.info("restarting guard in %.1fs", sleep_s)
-            for _ in range(int(sleep_s * 10)):
-                if stopping:
-                    break
-                time.sleep(0.1)
-            backoff_s = min(backoff_s * 2, backoff_max_s)
-    finally:
-        kill_child(signal.SIGTERM)
-        with contextlib.suppress(Exception):
-            if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
-                pid_path.unlink(missing_ok=True)
-        log.info("supervisor exiting")
-    return 0
+def uninstall() -> int:
+    rc = stop()
+    GuardServiceConfig.config_path().unlink(missing_ok=True)
+    conf_path().unlink(missing_ok=True)
+    say("uninstalled")
+    return rc

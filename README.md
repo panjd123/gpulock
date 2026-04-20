@@ -12,10 +12,10 @@ gpulock service start                       # 显式启动 guard
 
 `install.sh` 只做两件事，没有任何参数：
 
-1. `uv tool install -e . --force --reinstall --refresh`（找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`）
-2. `gpulock service install --no-start`：写默认 config 到 `${lock_root}/service/config.json`，**不启动**
+1. `uv tool install -e . --force --reinstall --refresh`（找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`）；会自动拉入 `supervisor>=4.2` 这个唯一的运行时依赖
+2. `gpulock service install --no-start`：写 `${lock_root}/service/{config.json,supervisord.conf}`，**不启动**
 
-backend 自动选 `systemd-user`（裸机）或 `supervisor`（容器），由 `gpulock service` 自己负责启停。只想要包不要 service：直接 `uv tool install -e .` 跳过脚本。
+guard 由 [supervisord](https://supervisord.org/)（PyPI `supervisor` 包）托管，裸机和容器一视同仁，不再有 backend 选择。只想要包不要 service：直接 `uv tool install -e .` 跳过脚本。
 
 ## 用法
 
@@ -41,16 +41,15 @@ gpulock check 1 -- python tests/operator_correctness.py
 - **防饥饿队列**：所有请求按到达顺序排队，writer 不会被持续到达的 reader 饿死。
 - **孤儿清理**：锁年龄 ≤ `--grace-age-s`（默认 180s）时不动；超期且 PID 已死 + GPU 无进程 + 多次探测稳定，才会被清理。
 
-## guard service（守护进程）
+## guard service（supervisord 托管）
 
-闲时占住显存防抢占，检测到 gpulock 自有任务/锁立刻让出，长时间无活动后进入休眠。
+闲时占住显存防抢占，检测到 gpulock 自有任务/锁立刻让出，长时间无活动后进入休眠；崩溃由 supervisord 自动拉起。
 
 ```bash
-gpulock service install [--backend auto|systemd-user|supervisor] \
-                        [--gpu-ids 0,1,2] [--idle-timeout 5400] \
-                        [--no-placeholder-load] [--no-start] [--no-enable]
-gpulock service start | stop | restart | status | logs [-n N] [-f]
-gpulock service show                          # backend 检测结果 + 当前配置
+gpulock service install [--gpu-ids 0,1,2] [--idle-timeout 5400] \
+                        [--no-placeholder-load] [--no-start] [--env K=V ...]
+gpulock service start | stop | restart | logs [-n N] [-f]
+gpulock service status                        # 配置 + 关键路径 + supervisord/guard 实时状态
 gpulock service config show                   # 打印 config.json 里所有 key=value
 gpulock service config get  <key>             # 读单个 key
 gpulock service config set  <k>=<v> [...]     # 改一/多个 key（提示 restart）
@@ -60,18 +59,19 @@ gpulock service config path                   # 打印 config.json 绝对路径
 gpulock service uninstall
 ```
 
-`install` 写一次 config 到 `${lock_root}/service/config.json`，之后日常调整都走 `config set/edit`，**改完用 `gpulock service restart` 让 guard 重新读取**。可改的 key：`backend`, `gpu_ids`, `idle_timeout`, `placeholder_idle_s`, `placeholder_load`（改 `backend` 需要先 `service uninstall` 再 `service install --no-start` 重建 backend artifacts）。
+`install` 在 `${lock_root}/service/` 下写两份文件：
 
-### Backend 选择（`--backend auto`）
+- `config.json` — gpulock 自己读写，存 `gpu_ids` / `idle_timeout` / 等运行时参数
+- `supervisord.conf` — 每次 `service start` / `service restart` 都从 `config.json` 重新生成，**不要手改**
 
-| 顺序 | 条件 | 选 |
-|---:|---|---|
-| 1 | 命中 `/.dockerenv` / `/run/.containerenv` / `KUBERNETES_SERVICE_HOST` / `/proc/1/cgroup` 有 docker\|containerd\|kubepods\|crio\|podman\|lxc | `supervisor` |
-| 2 | `systemctl --user show-environment` 能正常返回 | `systemd-user` |
-| 3 | 兜底 | `supervisor` |
+日常调整走 `config set/edit`，**改完用 `gpulock service restart` 让 supervisord 重新生成 conf 并重启 guard**。可改的 key：`gpu_ids`、`idle_timeout`、`placeholder_idle_s`、`placeholder_load`。
 
-- **`systemd-user`**：写 `~/.config/systemd/user/gpulock-guard.service`，靠 `systemctl --user` 管，日志走 `journalctl --user`。如果想登出后还跑：`loginctl enable-linger "$(whoami)"`。
-- **`supervisor`**：内置 mini supervisor，double-fork 脱离 shell，guard 崩溃按 1s→60s 指数退避重启。状态文件全在 `${lock_root}/service/`。前台 debug 用 `GPULOCK_SUPERVISOR_FOREGROUND=1 gpulock service _run-supervisor`。
+`status` 直接调 `supervisorctl status gpulock-guard`，`logs` 直接 tail `${lock_root}/service/guard.log`。需要更细的 supervisord 操作可以直接用：
+
+```bash
+$(python -c 'import sys; print(sys.executable)') -m supervisor.supervisorctl \
+    -c "${lock_root}/service/supervisord.conf" <action>
+```
 
 ### guard 行为要点
 
@@ -110,7 +110,13 @@ ${lock_root}/
 ├── guard.log         # guard 日志（rotating，20MB × 5）
 ├── guard.db          # 活动历史
 ├── gpulock.log       # 包装命令日志
-└── service/{config.json, supervisor.pid, service-guard.pid, supervisor.log}
+└── service/
+    ├── config.json        # gpulock 自己维护的运行时配置
+    ├── supervisord.conf   # 由 config.json 生成；start/restart 时覆盖
+    ├── supervisord.pid    # supervisord 自己写
+    ├── supervisord.log    # supervisord 自身日志
+    ├── supervisor.sock    # supervisorctl 用的 unix socket
+    └── guard.log          # guard 进程的 stdout+stderr（supervisord 接管）
 ```
 
 常用环境变量（CLI 同名 flag 也可用）：
@@ -131,9 +137,11 @@ ${lock_root}/
 
 | code | 含义 |
 |---:|---|
-| 0 | 子命令成功 |
+| 0 | 子命令成功；`service status` 也表示「installed + running」 |
+| 3 | `service status`：installed 但 supervisord/guard 没在跑 |
+| 4 | `service status`：还没装（缺 `config.json`） |
 | 124 | 等锁超时 |
-| 2 | 用了已移除的命令（`lock`/`unlock`/`release`/`gpuunlock`） |
+| 2 | 用了已移除的命令（`lock`/`unlock`/`release`/`gpuunlock`），或 service config 校验失败 |
 | 其他 | 子命令退出码或 gpulock 内部错误 |
 
 ## 兼容形式

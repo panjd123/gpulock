@@ -6,16 +6,16 @@ a shared host without disturbing real state. Exercises:
 * module import graph
 * env helpers
 * GuardServiceConfig save/load round-trip
-* backend detection
-* systemd unit rendering snapshot
 * lock acquire+release for read mode (write mode skipped: needs nvidia driver)
 * lock metadata persisted on disk
-* gpulock service show / install --no-start / status / uninstall lifecycle (no daemon)
+* gpulock service install --no-start / status / uninstall lifecycle
+* gpulock service config show/get/set/unset
+* install.sh sanity (no args)
+* supervisord daemon lifecycle (real fork)
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -48,8 +48,8 @@ def check(name: str, ok: bool, detail: object = "") -> None:
 print("=== module imports ===")
 try:
     import gpulock  # noqa: F401
-    from gpulock import cli, guard, lock, gpu, config, paths, placeholder, logging_setup
-    from gpulock.service import cli as service_cli, common, supervisor, systemd_user
+    from gpulock import cli, guard, lock, gpu, config, paths, placeholder, logging_setup  # noqa: F401
+    from gpulock.service import cli as service_cli, common, supervisor  # noqa: F401
     check("import gpulock + all submodules", True)
 except Exception as e:  # pragma: no cover
     check("import gpulock + all submodules", False, repr(e))
@@ -95,23 +95,8 @@ check("read_lock_pid", paths.read_lock_pid(fake_lock) == 12345)
 check("read_last_heartbeat_ms", paths.read_last_heartbeat_ms(fake_lock) == 987654321)
 
 
-print("\n=== service backend detection ===")
-in_ctr = common.in_container()
-sysd_ok = common.systemd_user_available()
-auto = common.resolve_backend("auto")
-print(f"     in_container={in_ctr}  systemd_user_available={sysd_ok}  auto -> {auto}")
-check("explicit backend supervisor accepted", common.resolve_backend("supervisor") == "supervisor")
-check("explicit backend systemd-user accepted", common.resolve_backend("systemd-user") == "systemd-user")
-try:
-    common.resolve_backend("nope")
-    check("invalid backend raises ValueError", False, "expected ValueError")
-except ValueError:
-    check("invalid backend raises ValueError", True)
-
-
 print("\n=== GuardServiceConfig round-trip ===")
 cfg = common.GuardServiceConfig(
-    backend="supervisor",
     gpu_ids=[0, 2, 5],
     idle_timeout=900,
     placeholder_idle_s=1.5,
@@ -134,24 +119,21 @@ check(
 )
 
 
-print("\n=== systemd unit render snapshot ===")
-unit_text = systemd_user.render_unit(cfg)
-expected_substrings = [
-    "[Unit]\nDescription=gpulock guard daemon",
-    "[Service]\nType=simple",
-    'Environment="FOO=bar"',
-    'Environment="K=v=eq"',
+print("\n=== supervisord conf rendering ===")
+conf_text = supervisor.render_conf(cfg)
+for needle in (
+    "[program:gpulock-guard]",
+    "[supervisord]",
+    "[unix_http_server]",
     "/opt/gpulock/bin/gpulock guard 0 2 5 --idle-timeout 900",
-    "Restart=on-failure",
-    "[Install]\nWantedBy=default.target",
-]
-for sub in expected_substrings:
-    check(f"unit contains: {sub.splitlines()[0][:48]!r}", sub in unit_text)
+    'environment=FOO="bar",K="v=eq"',
+    "autorestart=true",
+    "stdout_logfile=%(here)s/guard.log",
+):
+    check(f"rendered conf contains {needle!r}", needle in conf_text, conf_text[:200])
 
 
 print("\n=== read lock acquire+release (no nvidia driver needed) ===")
-# Read lock skips the write-lock idle precheck and only depends on the file
-# system, so it works fine without a real GPU.
 read_lock = lock.GpuBenchLock(physical_device_id=99, mode="read",
                               config=config.LockConfig(timeout_s=5))
 read_lock.acquire()
@@ -168,7 +150,6 @@ check(
     str(meta_live)[:200],
 )
 
-# Acquire a second read lock concurrently.
 read_lock_b = lock.GpuBenchLock(physical_device_id=99, mode="read",
                                 config=config.LockConfig(timeout_s=5))
 read_lock_b.acquire()
@@ -182,35 +163,46 @@ remaining = sorted((LOCK_ROOT / "gpu99" / "readers").glob("*.lock"))
 check("readers dir cleaned after release", remaining == [], f"remaining={remaining}")
 
 
-print("\n=== gpulock service show / install --no-start / status / uninstall (no daemon) ===")
+print("\n=== gpulock service install --no-start / status / uninstall (no daemon) ===")
 env = os.environ.copy()
 env["GPU_BENCH_LOCK_DIR"] = str(LOCK_ROOT)
 env["PYTHONPATH"] = str(REPO / "src")
 
-def run_cli(args: list[str]) -> tuple[int, str, str]:
+
+def run_cli(args: list[str], timeout: int = 20) -> tuple[int, str, str]:
     p = subprocess.run(
         [sys.executable, "-m", "gpulock", *args],
-        capture_output=True, text=True, env=env, timeout=20,
+        capture_output=True, text=True, env=env, timeout=timeout,
     )
     return p.returncode, p.stdout, p.stderr
 
-# Wipe any stale state before this section so the lifecycle is deterministic.
+
 service_dir = LOCK_ROOT / "service"
 if service_dir.exists():
     shutil.rmtree(service_dir)
 
-rc, out, err = run_cli(["service", "show"])
-check("service show (no install) rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
-check("service show reports installed: no", "installed: no" in out, out.strip())
+rc, out, err = run_cli(["service", "status"])
+check("service status (no install) rc=4", rc == 4, f"rc={rc}")
+check("service status (no install) reports installed: no",
+      "installed:" in out and "no" in out, out.strip())
 
 rc, out, err = run_cli(["service", "install", "--no-start", "--gpu-ids", "0,1",
                         "--idle-timeout", "600", "--no-placeholder-load",
                         "--env", "FOO=bar"])
 check("service install --no-start rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
-check("service install backend logged", "backend=" in out, out.strip())
+check(
+    "service install logs config path",
+    "config saved to" in out,
+    out.strip(),
+)
 check(
     "config.json written",
     (service_dir / "config.json").exists(),
+    str(list(service_dir.iterdir())),
+)
+check(
+    "supervisord.conf written",
+    (service_dir / "supervisord.conf").exists(),
     str(list(service_dir.iterdir())),
 )
 saved_cfg = json.loads((service_dir / "config.json").read_text())
@@ -219,9 +211,24 @@ check("config.json idle_timeout", saved_cfg["idle_timeout"] == 600, saved_cfg)
 check("config.json placeholder_load=False", saved_cfg["placeholder_load"] is False, saved_cfg)
 check("config.json extra_env", saved_cfg["extra_env"].get("FOO") == "bar", saved_cfg)
 
+conf_on_disk = (service_dir / "supervisord.conf").read_text()
+for needle in (
+    "[program:gpulock-guard]",
+    "--idle-timeout 600",
+    "--no-placeholder-load",
+    'environment=FOO="bar"',
+):
+    check(
+        f"supervisord.conf contains {needle!r}",
+        needle in conf_on_disk,
+        conf_on_disk[:200],
+    )
+
 rc, out, err = run_cli(["service", "status"])
-check("service status (stopped) rc!=0", rc != 0, f"rc={rc}")
-check("service status reports stopped", "supervisor: stopped" in out, out.strip())
+check("service status (installed, stopped) rc=3", rc == 3, f"rc={rc}")
+check("service status reports installed yes", "installed:    yes" in out, out.strip())
+check("service status reports supervisord stopped",
+      "supervisord:  stopped" in out, out.strip())
 
 print("\n=== gpulock service config show / get / set / unset ===")
 rc, out, err = run_cli(["service", "config", "path"])
@@ -230,7 +237,7 @@ check("config path printed", out.strip().endswith("config.json"), out.strip())
 
 rc, out, err = run_cli(["service", "config", "show"])
 check("config show rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
-for needle in ("backend=", "gpu_ids=0,1", "idle_timeout=600", "placeholder_load=false"):
+for needle in ("gpu_ids=0,1", "idle_timeout=600", "placeholder_load=false"):
     check(f"config show contains {needle!r}", needle in out, out.strip())
 
 rc, out, err = run_cli(["service", "config", "get", "idle_timeout"])
@@ -263,6 +270,10 @@ check("config unset restores default idle_timeout=5400",
 rc, out, err = run_cli(["service", "uninstall"])
 check("service uninstall rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
 check("config.json removed after uninstall", not (service_dir / "config.json").exists())
+check(
+    "supervisord.conf removed after uninstall",
+    not (service_dir / "supervisord.conf").exists(),
+)
 
 print("\n=== install.sh sanity (no args allowed) ===")
 install_sh = REPO / "install.sh"
@@ -280,40 +291,35 @@ check(
 )
 
 
-print("\n=== supervisor daemon lifecycle (real fork + exec) ===")
-# Install a config that will make the guard child exit immediately (no nvidia
-# driver in this container). The interesting thing we're testing is:
-#  1) `service start` daemonizes a supervisor that survives the parent process
-#  2) supervisor.pid file appears
-#  3) supervisor restarts the guard child after it crashes
-#  4) `service status` reports running
-#  5) `service stop` cleanly tears everything down
+print("\n=== supervisord daemon lifecycle (real fork) ===")
+ok, sup_err = supervisor.supervisor_available()
+if not ok:
+    print(f"  [SKIP] supervisor package not importable: {sup_err}")
+    print(f"         install with: {sys.executable} -m pip install --user 'supervisor>=4.2'")
+else:
+    if service_dir.exists():
+        shutil.rmtree(service_dir)
 
-if service_dir.exists():
-    shutil.rmtree(service_dir)
+    rc, out, err = run_cli([
+        "service", "install", "--no-start",
+        "--gpu-ids", "0",
+        "--idle-timeout", "10",
+        "--no-placeholder-load",
+    ])
+    check("install for daemon test rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
 
-rc, out, err = run_cli([
-    "service", "install", "--no-start",
-    "--gpu-ids", "0",
-    "--idle-timeout", "10",
-    "--no-placeholder-load",
-])
-check("install for daemon test rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+    rc, out, err = run_cli(["service", "start"])
+    check("service start rc=0", rc == 0,
+          f"rc={rc} stdout={out.strip()} stderr={err.strip()}")
 
-rc, out, err = run_cli(["service", "start"])
-check("service start rc=0", rc == 0, f"rc={rc} stdout={out.strip()} stderr={err.strip()}")
+    sup_pid_path = service_dir / "supervisord.pid"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not sup_pid_path.exists():
+        time.sleep(0.05)
+    check("supervisord.pid file exists", sup_pid_path.exists(), str(sup_pid_path))
 
-sup_pid_path = service_dir / "supervisor.pid"
-sup_log_path = service_dir / "supervisor.log"
-deadline = time.monotonic() + 5.0
-while time.monotonic() < deadline and not sup_pid_path.exists():
-    time.sleep(0.05)
-check("supervisor.pid file exists", sup_pid_path.exists(), str(sup_pid_path))
-
-sup_pid = 0
-if sup_pid_path.exists():
-    sup_pid = int(sup_pid_path.read_text().strip())
-    check("supervisor pid > 0", sup_pid > 0, f"pid={sup_pid}")
+    sup_pid = int(sup_pid_path.read_text().strip()) if sup_pid_path.exists() else 0
+    check("supervisord pid > 0", sup_pid > 0, f"pid={sup_pid}")
 
     def alive(pid: int) -> bool:
         try:
@@ -322,74 +328,60 @@ if sup_pid_path.exists():
         except OSError:
             return False
 
-    check("supervisor process alive", alive(sup_pid), f"pid={sup_pid}")
-
-    # supervisor parent (the python -m gpulock service _run-supervisor) should
-    # have exited after double-fork; verify the pid we recorded is NOT the
-    # short-lived launcher process by checking its parent != the test process.
-    # (we just check it's still alive after a beat)
-    time.sleep(0.5)
-    check("supervisor still alive after 0.5s (detached)", alive(sup_pid))
-
-# Let the supervisor try to spawn guard a few times. With no nvidia driver,
-# guard will exit non-zero. We expect to see at least one "guard exited"
-# message in the log within a few seconds.
-deadline = time.monotonic() + 6.0
-saw_exit = False
-last_log = ""
-while time.monotonic() < deadline:
-    if sup_log_path.exists():
-        last_log = sup_log_path.read_text(encoding="utf-8", errors="ignore")
-        if "guard exited" in last_log or "spawning guard" in last_log:
-            saw_exit = True
-            break
-    time.sleep(0.2)
-check(
-    "supervisor log records spawn/exit cycle",
-    saw_exit,
-    f"log tail={last_log[-400:]!r}",
-)
-
-rc, out, err = run_cli(["service", "status"])
-check("service status (running) rc=0", rc == 0, f"rc={rc} out={out.strip()}")
-check(
-    "service status reports supervisor running",
-    "supervisor: running" in out,
-    out.strip(),
-)
-
-# `logs -n 20` should print without crashing.
-rc, out, err = run_cli(["service", "logs", "-n", "20"])
-check("service logs rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
-check("service logs has supervisor lines", "supervisor" in out.lower(), out.strip()[-300:])
-
-# Now stop and verify cleanup.
-rc, out, err = run_cli(["service", "stop"])
-check("service stop rc=0", rc == 0, f"rc={rc} stdout={out.strip()} stderr={err.strip()}")
-
-# Wait for the supervisor process to actually go away.
-deadline = time.monotonic() + 5.0
-gone = False
-while time.monotonic() < deadline:
     if sup_pid > 0:
-        try:
-            os.kill(sup_pid, 0)
-        except OSError:
+        check("supervisord process alive", alive(sup_pid), f"pid={sup_pid}")
+        time.sleep(0.5)
+        check("supervisord still alive after 0.5s (detached)", alive(sup_pid))
+
+    # Wait for supervisord to attempt at least one guard spawn (the guard.log
+    # appears once supervisord opens the file).
+    guard_log = service_dir / "guard.log"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not guard_log.exists():
+        time.sleep(0.1)
+    check("guard.log was created (supervisord spawned guard)", guard_log.exists(),
+          str(guard_log))
+
+    rc, out, err = run_cli(["service", "status"])
+    # status returns 0 if supervisord is up AND program is RUNNING; otherwise
+    # supervisorctl may report a non-RUNNING state. Either way supervisord must
+    # be reported as running.
+    check(
+        "service status reports supervisord running",
+        "supervisord:  running" in out,
+        out.strip(),
+    )
+
+    if guard_log.exists():
+        rc, out, err = run_cli(["service", "logs", "-n", "20"])
+        check("service logs rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+
+    rc, out, err = run_cli(["service", "stop"], timeout=40)
+    check("service stop rc=0", rc == 0,
+          f"rc={rc} stdout={out.strip()} stderr={err.strip()}")
+
+    deadline = time.monotonic() + 5.0
+    gone = False
+    while time.monotonic() < deadline:
+        if sup_pid > 0 and not alive(sup_pid):
             gone = True
             break
-    time.sleep(0.1)
-check("supervisor process gone after stop", gone, f"pid={sup_pid}")
-check("supervisor.pid removed after stop", not sup_pid_path.exists())
+        time.sleep(0.1)
+    check("supervisord process gone after stop", gone, f"pid={sup_pid}")
+    check("supervisord.pid removed after stop", not sup_pid_path.exists())
 
-# Idempotent stop / status / uninstall.
-rc, out, err = run_cli(["service", "stop"])
-check("service stop is idempotent", rc == 0, f"rc={rc} out={out.strip()}")
-rc, out, err = run_cli(["service", "uninstall"])
-check("service uninstall after stop rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
-check(
-    "config.json removed after final uninstall",
-    not (service_dir / "config.json").exists(),
-)
+    rc, out, err = run_cli(["service", "stop"])
+    check("service stop is idempotent", rc == 0, f"rc={rc} out={out.strip()}")
+    rc, out, err = run_cli(["service", "uninstall"])
+    check("service uninstall after stop rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+    check(
+        "config.json removed after final uninstall",
+        not (service_dir / "config.json").exists(),
+    )
+    check(
+        "supervisord.conf removed after final uninstall",
+        not (service_dir / "supervisord.conf").exists(),
+    )
 
 print("\n=== summary ===")
 if failures:
