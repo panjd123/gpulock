@@ -223,9 +223,61 @@ rc, out, err = run_cli(["service", "status"])
 check("service status (stopped) rc!=0", rc != 0, f"rc={rc}")
 check("service status reports stopped", "supervisor: stopped" in out, out.strip())
 
+print("\n=== gpulock service config show / get / set / unset ===")
+rc, out, err = run_cli(["service", "config", "path"])
+check("config path rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+check("config path printed", out.strip().endswith("config.json"), out.strip())
+
+rc, out, err = run_cli(["service", "config", "show"])
+check("config show rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+for needle in ("backend=", "gpu_ids=0,1", "idle_timeout=600", "placeholder_load=false"):
+    check(f"config show contains {needle!r}", needle in out, out.strip())
+
+rc, out, err = run_cli(["service", "config", "get", "idle_timeout"])
+check("config get idle_timeout rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+check("config get idle_timeout==600", out.strip() == "600", out.strip())
+
+rc, out, err = run_cli(["service", "config", "get", "bogus"])
+check("config get bogus rc!=0", rc != 0, f"rc={rc}")
+
+rc, out, err = run_cli([
+    "service", "config", "set",
+    "gpu_ids=2,3,4", "idle_timeout=1234", "placeholder_load=true",
+])
+check("config set rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+check("config set hints restart", "service restart" in out, out.strip())
+saved_cfg2 = json.loads((service_dir / "config.json").read_text())
+check("config set persisted gpu_ids", saved_cfg2["gpu_ids"] == [2, 3, 4], saved_cfg2)
+check("config set persisted idle_timeout", saved_cfg2["idle_timeout"] == 1234, saved_cfg2)
+check("config set persisted placeholder_load", saved_cfg2["placeholder_load"] is True, saved_cfg2)
+
+rc, out, err = run_cli(["service", "config", "set", "idle_timeout=not-a-number"])
+check("config set bad value rc!=0", rc != 0, f"rc={rc}")
+
+rc, out, err = run_cli(["service", "config", "unset", "idle_timeout"])
+check("config unset rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
+saved_cfg3 = json.loads((service_dir / "config.json").read_text())
+check("config unset restores default idle_timeout=5400",
+      saved_cfg3["idle_timeout"] == 5400, saved_cfg3)
+
 rc, out, err = run_cli(["service", "uninstall"])
 check("service uninstall rc=0", rc == 0, f"rc={rc} stderr={err.strip()}")
 check("config.json removed after uninstall", not (service_dir / "config.json").exists())
+
+print("\n=== install.sh sanity (no args allowed) ===")
+install_sh = REPO / "install.sh"
+p = subprocess.run(["bash", "-n", str(install_sh)], capture_output=True, text=True)
+check("install.sh syntax OK", p.returncode == 0, p.stderr.strip())
+p = subprocess.run(
+    ["bash", str(install_sh), "--gpu-ids", "0"],
+    capture_output=True, text=True,
+)
+check("install.sh rejects extra args (rc=2)", p.returncode == 2, f"rc={p.returncode}")
+check(
+    "install.sh suggests `gpulock service`",
+    "gpulock service" in p.stderr,
+    p.stderr.strip(),
+)
 
 
 print("\n=== supervisor daemon lifecycle (real fork + exec) ===")

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import subprocess
 import sys
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from . import supervisor as supervisor_backend
 from . import systemd_user as systemd_backend
@@ -32,6 +34,35 @@ def _parse_gpu_ids(raw: Optional[str]) -> list[int]:
         except ValueError:
             raise SystemExit(f"[gpulock service] invalid GPU id: {token!r}")
     return items
+
+
+def _parse_bool(raw: str) -> bool:
+    s = raw.strip().lower()
+    if s in ("1", "true", "yes", "on", "y", "t"):
+        return True
+    if s in ("0", "false", "no", "off", "n", "f"):
+        return False
+    raise ValueError(f"expected bool, got {raw!r}")
+
+
+def _parse_backend_value(raw: str) -> str:
+    s = raw.strip()
+    if s in (AUTO_BACKEND, *SUPPORTED_BACKENDS):
+        return s
+    raise ValueError(
+        f"expected one of: {AUTO_BACKEND}/{'/'.join(SUPPORTED_BACKENDS)}, got {raw!r}"
+    )
+
+
+# Settable config keys (via `gpulock service config set/get/unset`),
+# mapped to their parser and the default to restore on `unset`.
+_CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Any]] = {
+    "backend": (_parse_backend_value, SUPERVISOR_BACKEND),
+    "gpu_ids": (_parse_gpu_ids, []),
+    "idle_timeout": (int, 5400),
+    "placeholder_idle_s": (float, 0.0),
+    "placeholder_load": (_parse_bool, True),
+}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -86,6 +117,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p_logs.add_argument("-f", "--follow", action="store_true")
 
     p_show = sub.add_parser("show", help="show resolved service configuration / detection")
+
+    # `gpulock service config <action>` — manage guard runtime config
+    p_config = sub.add_parser(
+        "config",
+        help="show / modify the guard service config (apply with `service restart`)",
+    )
+    cfg_sub = p_config.add_subparsers(dest="config_action", metavar="ACTION", required=True)
+    cfg_sub.add_parser("show", help="print current config (key=value)")
+    cfg_sub.add_parser("path", help="print the config file path")
+    p_get = cfg_sub.add_parser("get", help="print one config value")
+    p_get.add_argument("key", help=f"one of: {', '.join(sorted(_CONFIG_KEYS))}")
+    p_set = cfg_sub.add_parser("set", help="set one or more config values")
+    p_set.add_argument(
+        "kv", nargs="+", metavar="KEY=VALUE",
+        help=f"settable keys: {', '.join(sorted(_CONFIG_KEYS))}",
+    )
+    p_unset = cfg_sub.add_parser("unset", help="reset one config value to its default")
+    p_unset.add_argument("key", help=f"one of: {', '.join(sorted(_CONFIG_KEYS))}")
+    cfg_sub.add_parser("edit", help="open the config file in $EDITOR")
 
     # Internal: long-running supervisor process, started by `service start`.
     p_run = sub.add_parser("_run-supervisor", help=argparse.SUPPRESS)
@@ -215,6 +265,130 @@ def _do_logs(args: argparse.Namespace) -> int:
     return 2
 
 
+def _format_config_value(key: str, value: Any) -> str:
+    if key == "gpu_ids":
+        return ",".join(str(x) for x in value) if value else ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _load_cfg_for_config_cmd() -> GuardServiceConfig:
+    try:
+        return GuardServiceConfig.load()
+    except FileNotFoundError as e:
+        raise SystemExit(f"[gpulock service] {e}")
+
+
+def _do_config(args: argparse.Namespace) -> int:
+    sub = args.config_action
+
+    if sub == "path":
+        print(GuardServiceConfig.config_path())
+        return 0
+
+    if sub == "show":
+        cfg = _load_cfg_for_config_cmd()
+        print(f"# {GuardServiceConfig.config_path()}")
+        for key in sorted(_CONFIG_KEYS):
+            print(f"{key}={_format_config_value(key, getattr(cfg, key))}")
+        if cfg.extra_env:
+            print(f"# extra_env (use `config edit` to modify): {cfg.extra_env}")
+        return 0
+
+    if sub == "get":
+        cfg = _load_cfg_for_config_cmd()
+        if args.key not in _CONFIG_KEYS:
+            print(
+                f"[gpulock service] unknown key {args.key!r}; "
+                f"settable keys: {', '.join(sorted(_CONFIG_KEYS))}",
+                file=sys.stderr,
+            )
+            return 2
+        print(_format_config_value(args.key, getattr(cfg, args.key)))
+        return 0
+
+    if sub == "set":
+        cfg = _load_cfg_for_config_cmd()
+        backend_changed_from = None
+        for item in args.kv:
+            if "=" not in item:
+                print(f"[gpulock service] expected KEY=VALUE, got {item!r}", file=sys.stderr)
+                return 2
+            key, raw = item.split("=", 1)
+            key = key.strip()
+            if key not in _CONFIG_KEYS:
+                print(
+                    f"[gpulock service] unknown key {key!r}; "
+                    f"settable keys: {', '.join(sorted(_CONFIG_KEYS))}",
+                    file=sys.stderr,
+                )
+                return 2
+            parser_fn, _default = _CONFIG_KEYS[key]
+            try:
+                value = parser_fn(raw)
+            except (ValueError, SystemExit) as e:
+                print(f"[gpulock service] invalid value for {key}: {e}", file=sys.stderr)
+                return 2
+            if key == "backend" and value != cfg.backend:
+                backend_changed_from = cfg.backend
+            setattr(cfg, key, value)
+        cfg.save()
+        print(f"[gpulock service] config updated: {GuardServiceConfig.config_path()}")
+        if backend_changed_from is not None:
+            print(
+                f"[gpulock service] WARNING: backend changed ({backend_changed_from} -> {cfg.backend}); "
+                "you must run `gpulock service uninstall` (with the old backend active) "
+                "and then `gpulock service install --no-start` to switch.",
+                file=sys.stderr,
+            )
+        else:
+            print("[gpulock service] apply with: gpulock service restart")
+        return 0
+
+    if sub == "unset":
+        cfg = _load_cfg_for_config_cmd()
+        if args.key not in _CONFIG_KEYS:
+            print(
+                f"[gpulock service] unknown key {args.key!r}; "
+                f"settable keys: {', '.join(sorted(_CONFIG_KEYS))}",
+                file=sys.stderr,
+            )
+            return 2
+        _parser, default = _CONFIG_KEYS[args.key]
+        setattr(cfg, args.key, default() if callable(default) else default)
+        cfg.save()
+        print(f"[gpulock service] reset {args.key} to default")
+        print("[gpulock service] apply with: gpulock service restart")
+        return 0
+
+    if sub == "edit":
+        path = GuardServiceConfig.config_path()
+        if not path.exists():
+            print(
+                f"[gpulock service] no config at {path}. run `gpulock service install --no-start` first.",
+                file=sys.stderr,
+            )
+            return 2
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+        try:
+            ret = subprocess.call([editor, str(path)])
+        except FileNotFoundError:
+            print(f"[gpulock service] editor not found: {editor!r}", file=sys.stderr)
+            return 2
+        if ret == 0:
+            try:
+                GuardServiceConfig.load()  # validate
+            except Exception as e:  # noqa: BLE001
+                print(f"[gpulock service] WARNING: config did not parse cleanly: {e}", file=sys.stderr)
+                return 1
+            print("[gpulock service] config saved. apply with: gpulock service restart")
+        return ret
+
+    print(f"[gpulock service] unknown config action: {sub}", file=sys.stderr)
+    return 2
+
+
 def _do_show(_args: argparse.Namespace) -> int:
     in_ctr = in_container()
     sysd_ok = systemd_user_available()
@@ -253,6 +427,8 @@ def cmd_service(argv: list[str]) -> int:
         return _do_logs(args)
     if action == "show":
         return _do_show(args)
+    if action == "config":
+        return _do_config(args)
     if action == "_run-supervisor":
         return supervisor_backend.run_supervisor()
     parser.error(f"unknown action: {action}")
