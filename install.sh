@@ -13,7 +13,7 @@
 #
 # Environment overrides (only for the package install step):
 #   GPULOCK_INSTALLER=uv|pip|auto       # default: auto (uv > pip)
-#   UV_LINK_MODE=copy                   # uv tool install link mode (default: copy)
+#   UV_LINK_MODE=copy                   # kept for compatibility; ignored in editable installs
 #   PYTHON_BIN=/path/to/python          # only used by the pip fallback
 set -euo pipefail
 
@@ -35,15 +35,18 @@ esac
 cd "${SCRIPT_DIR}"
 
 # --- 1. install the python package ----------------------------------------
+# Use editable installs for repo-local setup. `uv tool install .` has shown
+# stale-build behavior with local paths; editable mode keeps the installed
+# entrypoint bound to the current checkout.
 if (( want_uv )) && command -v uv >/dev/null 2>&1; then
-  UV_LINK_MODE="${UV_LINK_MODE:-copy}" uv tool install . --force
+  UV_LINK_MODE="${UV_LINK_MODE:-copy}" uv tool install -e . --force --reinstall --refresh
   echo "[install.sh] installed package with uv: gpulock"
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
   command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
     echo "[install.sh] missing python interpreter: ${PYTHON_BIN}" >&2; exit 1
   }
-  "${PYTHON_BIN}" -m pip install --user .
+  "${PYTHON_BIN}" -m pip install --user --editable .
   echo "[install.sh] installed package with pip: gpulock"
 fi
 

@@ -1,2 +1,11 @@
 __pycache__/
 *.pyc
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/

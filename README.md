@@ -12,10 +12,10 @@ gpulock service start                       # 显式启动 guard
 
 `install.sh` 只做两件事，没有任何参数：
 
-1. `uv tool install . --force`（找不到 `uv` 才回退到 `python3 -m pip install --user .`）
+1. `uv tool install -e . --force --reinstall --refresh`（找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`）
 2. `gpulock service install --no-start`：写默认 config 到 `${lock_root}/service/config.json`，**不启动**
 
-backend 自动选 `systemd-user`（裸机）或 `supervisor`（容器），由 `gpulock service` 自己负责启停。只想要包不要 service：直接 `uv tool install .` 跳过脚本。
+backend 自动选 `systemd-user`（裸机）或 `supervisor`（容器），由 `gpulock service` 自己负责启停。只想要包不要 service：直接 `uv tool install -e .` 跳过脚本。
 
 ## 用法
 
