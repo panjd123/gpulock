@@ -29,7 +29,7 @@ gpulock guard [gpu_id ...]
 ```bash
 gpulock perf 1 -- ./build/operator_benchmark --case matmul_fp16 --size 4096
 gpulock perf --wait-gpu-idle 1 -- ./build/operator_benchmark --case matmul_fp16 --size 4096
-gpulock check 1 -- /opt/base/bin/python tests/operator_correctness.py
+gpulock check 1 -- python tests/operator_correctness.py
 ```
 
 ## 读写锁语义
@@ -111,14 +111,139 @@ gpulock --perf <gpu_id> -- <cmd>
 gpulock --check <gpu_id> -- <cmd>
 ```
 
-## 全局安装
+## 安装
+
+`gpulock` 是标准 Python 包，安装后的 `gpulock` / `gpuunlock` 命令会绑定到安装时使用的 Python 解释器。
+依赖里直接包含 `torch` 和 `setproctitle`，**不再有 optional extras**。
+
+推荐方式：直接执行仓库内脚本，一条命令同时完成「装包」和「装 guard service」：
 
 ```bash
 ./install.sh
-gpulock --help
 ```
 
-安装后可用命令：`gpulock`。
+`./install.sh` 不带任何参数时会：
+
+1. 优先用 `uv tool install . --force`（`UV_LINK_MODE=copy`，对 HDFS / NFS 友好）；
+   找不到 `uv` 才回退到 `python3 -m pip install --user .`
+2. 调用 `gpulock service install --backend auto`，自动选择 `systemd-user` 还是 `supervisor`，
+   把 guard 装成长驻 service 并立刻启动
+
+常用变体：
+
+```bash
+./install.sh --gpu-ids 0,1                       # 只监控指定 GPU
+./install.sh --backend systemd-user              # 强制 systemd --user backend
+./install.sh --backend supervisor                # 强制 supervisor backend（容器场景）
+./install.sh --idle-timeout 5400                 # 自定义 idle timeout
+./install.sh --no-start                          # 写配置但不立刻启动 service
+./install.sh --no-enable                         # systemd: 不开机自启
+./install.sh --no-placeholder-load               # 关掉 placeholder 计算 loop
+```
+
+如果你想直接用 `uv` / `pip` 自己装包，再手动跑 service 安装也可以：
+
+```bash
+uv tool install .
+gpulock service install            # 默认 --backend auto
+```
+
+`install.sh` 接受的命令行 flag 都有对应的环境变量，方便在 CI / Dockerfile 里调用：
+
+- `GPULOCK_INSTALLER=uv|pip|auto`
+- `UV_LINK_MODE=copy`
+- `PYTHON_BIN=/path/to/python`（仅 `pip` 回退路径使用）
+- `GPULOCK_SERVICE_BACKEND=auto|systemd-user|supervisor`
+- `GPULOCK_SERVICE_GPU_IDS="0,1,2"`
+- `GPULOCK_SERVICE_IDLE_TIMEOUT=5400`
+- `GPULOCK_SERVICE_NO_START=1`
+- `GPULOCK_SERVICE_NO_ENABLE=1`
+- `GPULOCK_SERVICE_NO_PLACEHOLDER_LOAD=1`
+
+如果想完全跳过 service 安装（罕见情况，例如只是想拿 `gpulock perf/check`），就直接走 `uv tool install .` /
+`pip install .` 不要跑 `install.sh`。
+
+## 把 guard 当 service 安装（`gpulock service`）
+
+`gpulock guard` 现在可以直接以 service 的方式安装、管理，不需要再手写 `nohup gpulock guard &` / `tmux` /
+`screen` 之类的兜底方案。两种 backend：
+
+- **`systemd-user`**：宿主机 / 裸机环境的首选。会写 `~/.config/systemd/user/gpulock-guard.service`，
+  通过 `systemctl --user` 来 enable / start / status / stop，日志走 `journalctl --user`。
+- **`supervisor`**：容器（Docker、k8s pod、podman 等）以及没有 systemd 的环境。
+  gpulock 自己 fork 一个常驻的 supervisor 进程（double-fork 脱离当前终端），负责拉起 `gpulock guard`
+  并在崩溃时按指数退避重启；PID / 日志写在 `${lock_root}/service/`。
+
+默认 `--backend auto` 的判定规则：
+
+1. 命中 `/.dockerenv`、`/run/.containerenv`、`KUBERNETES_SERVICE_HOST` 或 `/proc/1/cgroup`
+   含 `docker|containerd|kubepods|crio|podman|lxc` -> 使用 `supervisor`
+2. `systemctl --user show-environment` 能正常返回 -> 使用 `systemd-user`
+3. 否则回落到 `supervisor`
+
+可以用 `gpulock service show` 看 detection / 当前安装状态。
+
+### 常用命令
+
+```bash
+# 安装并启动（自动选择 backend，监控所有可见 GPU）
+gpulock service install
+
+# 自定义参数
+gpulock service install \
+    --backend auto \
+    --gpu-ids 0,1,2 \
+    --idle-timeout 5400 \
+    --placeholder-idle-s 0.0 \
+    --placeholder-load \
+    --env GPU_BENCH_LOG_LEVEL=INFO
+
+# 仅写配置不立刻启动
+gpulock service install --no-start
+
+# 启停 / 状态 / 日志
+gpulock service start
+gpulock service stop
+gpulock service restart
+gpulock service status
+gpulock service logs           # 默认 tail 最后 200 行
+gpulock service logs -n 1000 -f
+
+# systemd 专属：开关启动项（容器场景下是 no-op，supervisor 自带 auto-restart）
+gpulock service enable
+gpulock service disable
+
+# 卸载
+gpulock service uninstall
+```
+
+`gpulock service install` 把使用过的参数固化到 `${lock_root}/service/config.json`，重启 service 后会按
+同一份配置拉起 guard，避免每次都要记环境变量。
+
+### systemd-user 注意事项
+
+- 想让 service 在你没登录时也跑（典型场景：远程节点），需要执行一次：
+  ```bash
+  loginctl enable-linger "$(whoami)"
+  ```
+- 日志看 `journalctl --user -u gpulock-guard.service -f` 或 `gpulock service logs -f`。
+- 如果 `XDG_RUNTIME_DIR` 没设置（某些精简的容器 / 远程 shell），`systemctl --user` 会连不上 user manager，
+  这时建议显式 `--backend supervisor`。
+
+### supervisor backend（容器内）
+
+- 启动后会 double-fork 脱离当前 shell，写 PID 到 `${lock_root}/service/supervisor.pid`，
+  child guard PID 写在 `${lock_root}/service/service-guard.pid`。
+- 日志统一进 `${lock_root}/service/supervisor.log`（rotating，20MB × 5 份）；guard 自身的日志仍然
+  在 `${lock_root}/guard.log`。
+- guard 崩溃时 supervisor 按 1s → 60s 指数退避重启；连续运行 ≥ 30s 后退避 reset 到 1s。
+- 想前台 debug 时可以 `GPULOCK_SUPERVISOR_FOREGROUND=1 gpulock service _run-supervisor`，跳过 daemonize。
+- 在 docker 镜像里，可以在 entrypoint 里追加：
+  ```bash
+  gpulock service install --backend supervisor --gpu-ids "${GPULOCK_GPU_IDS:-}"
+  exec your-real-entrypoint
+  ```
+  这样容器一启动 guard 就跑起来了；container 退出时 supervisor 也会被 PID 1 的 SIGTERM 链路顺带带走。
 
 ## 锁目录
 
@@ -136,6 +261,7 @@ gpulock --help
 - 命令日志：`${lock_root}/gpulock.log`
 - 守护日志：`${lock_root}/guard.log`
 - 活动数据库：`${lock_root}/guard.db`
+- service 配置 / supervisor 状态：`${lock_root}/service/`
 
 ## 关键参数（可用环境变量或 CLI）
 
