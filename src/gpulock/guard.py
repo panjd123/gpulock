@@ -157,7 +157,7 @@ def cmd_guard(argv: list[str]) -> int:
         )
         placeholders[gid] = proc
         placeholder_started_at[gid] = time.time()
-        if not wait_placeholder_ready(gpu_dir, timeout_s=10.0):
+        if not wait_placeholder_ready(gpu_dir, timeout_s=60.0):
             with contextlib.suppress(Exception):
                 proc.terminate()
             with contextlib.suppress(Exception):
