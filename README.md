@@ -12,10 +12,10 @@ gpulock service start                       # 显式启动 guard
 
 `install.sh` 只做两件事，没有任何参数：
 
-1. `uv tool install -e . --force --reinstall --refresh`（找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`）；会自动拉入 `supervisor>=4.2` 这个唯一的运行时依赖
+1. 安装 Python 包本体（`uv tool install -e . --force --reinstall --refresh`；找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`），并显式安装 placeholder 依赖的 PyTorch CUDA 11.8 wheel：默认 `torch==2.7.1` + `cu118`
 2. `gpulock service install --no-start`：写 `${lock_root}/service/{config.json,supervisord.conf}`，**不启动**
 
-guard 由 [supervisord](https://supervisord.org/)（PyPI `supervisor` 包）托管，裸机和容器一视同仁，不再有 backend 选择。只想要包不要 service：直接 `uv tool install -e .` 跳过脚本。
+这样做是为了避免 `pip install torch` / 默认 `uv` 解析把环境带到过新的 CUDA wheel，导致老驱动机器上 placeholder 无法起起来。guard 由 [supervisord](https://supervisord.org/)（PyPI `supervisor` 包）托管，裸机和容器一视同仁，不再有 backend 选择。只想要包不要 service：直接 `uv tool install -e . --with torch==2.7.1 --torch-backend cu118` 跳过脚本。
 
 ## 用法
 

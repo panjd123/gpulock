@@ -153,7 +153,8 @@ def cmd_guard(argv: list[str]) -> int:
             ],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         placeholders[gid] = proc
         placeholder_started_at[gid] = time.time()
@@ -164,7 +165,14 @@ def cmd_guard(argv: list[str]) -> int:
                 proc.wait(timeout=5)
             placeholders.pop(gid, None)
             placeholder_started_at.pop(gid, None)
-            log.warning("gpu%d: placeholder worker failed to become ready", gid)
+            stderr_text = ""
+            if proc.stderr is not None:
+                with contextlib.suppress(Exception):
+                    stderr_text = proc.stderr.read().strip()
+            if stderr_text:
+                log.warning("gpu%d: placeholder worker failed to become ready: %s", gid, stderr_text)
+            else:
+                log.warning("gpu%d: placeholder worker failed to become ready", gid)
             return False
         (gpu_dir / "placeholder.pid").write_text(str(proc.pid))
         placeholder_fail_reported.discard(gid)
@@ -243,6 +251,10 @@ def cmd_guard(argv: list[str]) -> int:
 
                 if gid in placeholders and placeholders[gid].poll() is not None:
                     rc = placeholders[gid].returncode
+                    stderr_text = ""
+                    if placeholders[gid].stderr is not None:
+                        with contextlib.suppress(Exception):
+                            stderr_text = placeholders[gid].stderr.read().strip()
                     del placeholders[gid]
                     placeholder_started_at.pop(gid, None)
                     placeholder_active.discard(gid)
@@ -252,10 +264,16 @@ def cmd_guard(argv: list[str]) -> int:
                         rc = -1
                     if rc != 0 and gid not in placeholder_fail_reported:
                         placeholder_fail_reported.add(gid)
-                        log.warning(
-                            "gpu%d: placeholder start failed (rc=%d), suppressing repeated errors until it runs successfully",
-                            gid, rc,
-                        )
+                        if stderr_text:
+                            log.warning(
+                                "gpu%d: placeholder start failed (rc=%d): %s; suppressing repeated errors until it runs successfully",
+                                gid, rc, stderr_text,
+                            )
+                        else:
+                            log.warning(
+                                "gpu%d: placeholder start failed (rc=%d), suppressing repeated errors until it runs successfully",
+                                gid, rc,
+                            )
 
                 ph_alive = gid in placeholders and placeholders[gid].poll() is None
                 if ph_alive and gid in placeholder_fail_reported:

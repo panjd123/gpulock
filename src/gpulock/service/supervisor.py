@@ -208,7 +208,8 @@ def start() -> int:
         warn(
             f"supervisor package not importable: {err}\n"
             "  reinstall gpulock to pull in the dependency:\n"
-            "    uv tool install . --force   # or: pip install --user ."
+            "    uv tool install -e . --force --reinstall --refresh --with torch==2.7.1 --torch-backend cu118\n"
+            "    # or: ./install.sh"
         )
         return 1
 

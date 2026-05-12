@@ -13,6 +13,8 @@
 #
 # Environment overrides (only for the package install step):
 #   GPULOCK_INSTALLER=uv|pip|auto       # default: auto (uv > pip)
+#   GPULOCK_TORCH_VERSION=2.7.1         # default torch version for the placeholder worker
+#   GPULOCK_TORCH_BACKEND=cu118         # default CUDA wheel backend for torch
 #   UV_LINK_MODE=copy                   # kept for compatibility; ignored in editable installs
 #   PYTHON_BIN=/path/to/python          # only used by the pip fallback
 set -euo pipefail
@@ -25,6 +27,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="${GPULOCK_INSTALLER:-auto}"
+TORCH_VERSION="${GPULOCK_TORCH_VERSION:-2.7.1}"
+TORCH_BACKEND="${GPULOCK_TORCH_BACKEND:-cu118}"
+TORCH_INDEX_URL="https://download.pytorch.org/whl/${TORCH_BACKEND}"
 
 case "${INSTALLER}" in
   auto|uv) want_uv=1 ;;
@@ -39,15 +44,23 @@ cd "${SCRIPT_DIR}"
 # stale-build behavior with local paths; editable mode keeps the installed
 # entrypoint bound to the current checkout.
 if (( want_uv )) && command -v uv >/dev/null 2>&1; then
-  UV_LINK_MODE="${UV_LINK_MODE:-copy}" uv tool install -e . --force --reinstall --refresh
+  UV_LINK_MODE="${UV_LINK_MODE:-copy}" uv tool install -e . \
+    --force --reinstall --refresh \
+    --with "torch==${TORCH_VERSION}" \
+    --torch-backend "${TORCH_BACKEND}"
   echo "[install.sh] installed package with uv: gpulock"
+  echo "[install.sh] installed torch ${TORCH_VERSION} (${TORCH_BACKEND}) into the uv tool env"
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
   command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
     echo "[install.sh] missing python interpreter: ${PYTHON_BIN}" >&2; exit 1
   }
   "${PYTHON_BIN}" -m pip install --user --editable .
+  "${PYTHON_BIN}" -m pip install --user --force-reinstall \
+    "torch==${TORCH_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}"
   echo "[install.sh] installed package with pip: gpulock"
+  echo "[install.sh] installed torch ${TORCH_VERSION} from ${TORCH_INDEX_URL}"
 fi
 
 command -v gpulock >/dev/null 2>&1 || {
