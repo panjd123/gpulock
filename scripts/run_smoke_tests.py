@@ -95,6 +95,27 @@ check("read_lock_pid", paths.read_lock_pid(fake_lock) == 12345)
 check("read_last_heartbeat_ms", paths.read_last_heartbeat_ms(fake_lock) == 987654321)
 
 
+print("\n=== notify_guard_activity persists last + history ===")
+lock.notify_guard_activity(LOCK_ROOT, 99, "read")
+guard_db = LOCK_ROOT / "guard.db"
+check("guard.db created by notify_guard_activity", guard_db.exists(), str(guard_db))
+if guard_db.exists():
+    import sqlite3
+
+    conn = sqlite3.connect(str(guard_db))
+    last_row = conn.execute(
+        "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
+        (99,),
+    ).fetchone()
+    hist_row = conn.execute(
+        "SELECT COUNT(*) FROM gpu_activity WHERE gpu_id=? AND active=1",
+        (99,),
+    ).fetchone()
+    conn.close()
+    check("gpu_last_activity row exists", last_row is not None, str(last_row))
+    check("gpu_activity history row exists", bool(hist_row and hist_row[0] >= 1), str(hist_row))
+
+
 print("\n=== GuardServiceConfig round-trip ===")
 cfg = common.GuardServiceConfig(
     gpu_ids=[0, 2, 5],

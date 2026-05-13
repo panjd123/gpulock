@@ -35,17 +35,44 @@ def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS gpu_activity (ts REAL NOT NULL, gpu_id INTEGER NOT NULL, active INTEGER NOT NULL)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gpu_ts ON gpu_activity(gpu_id, ts)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS gpu_last_activity (gpu_id INTEGER PRIMARY KEY, last_activity_ts REAL NOT NULL)"
+    )
     conn.commit()
     return conn
 
 
+def _touch_last_activity(conn: sqlite3.Connection, gpu_id: int, ts: float) -> None:
+    conn.execute(
+        "INSERT INTO gpu_last_activity(gpu_id, last_activity_ts) VALUES (?, ?) "
+        "ON CONFLICT(gpu_id) DO UPDATE SET last_activity_ts=excluded.last_activity_ts",
+        (gpu_id, ts),
+    )
+
+
+def _record_activity_event(conn: sqlite3.Connection, gpu_id: int, ts: float) -> None:
+    conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (ts, gpu_id, 1))
+    _touch_last_activity(conn, gpu_id, ts)
+
+
 def _has_recent_activity(conn: sqlite3.Connection, gpu_id: int, window_s: float = 5400) -> bool:
-    cutoff = time.time() - window_s
     row = conn.execute(
-        "SELECT COUNT(*) FROM gpu_activity WHERE gpu_id=? AND active=1 AND ts>?",
-        (gpu_id, cutoff),
+        "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
+        (gpu_id,),
     ).fetchone()
-    return row[0] > 0
+    if row is None:
+        return False
+    try:
+        last_ts = float(row[0])
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - last_ts) <= max(window_s, 0.0)
+
+
+def _prune_activity_history(conn: sqlite3.Connection, now_ts: float, retention_s: float = 86400.0) -> int:
+    cutoff = now_ts - max(retention_s, 0.0)
+    cur = conn.execute("DELETE FROM gpu_activity WHERE ts<?", (cutoff,))
+    return int(cur.rowcount or 0)
 
 
 def _has_recent_pulse(last_pulse_ts: dict[int, float], gpu_id: int, window_s: float) -> bool:
@@ -105,7 +132,7 @@ def cmd_guard(argv: list[str]) -> int:
     idle_since: dict[int, float] = {}
     dormant: set[int] = set()
     last_pulse_ts: dict[int, float] = {}
-    clean_counter = 0
+    last_history_prune_ts = 0.0
 
     def ingest_activity_pulse(gid: int) -> None:
         pulse_path = lock_root / f"gpu{gid}" / "activity.pulse"
@@ -125,7 +152,7 @@ def cmd_guard(argv: list[str]) -> int:
         mode = meta.get("mode", "unknown")
         pid = meta.get("pid", "?")
         cmd = meta.get("cmdline", "").strip() or "<unknown>"
-        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (time.time(), gid, 1))
+        _record_activity_event(conn, gid, time.time())
         idle_since.pop(gid, None)
         if gid in dormant:
             dormant.discard(gid)
@@ -226,12 +253,14 @@ def cmd_guard(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    # Treat guard startup as one user activity pulse so placeholder is not
-    # immediately considered idle/dormant before user starts real workloads.
+    # Seed last-activity timestamps so a fresh guard start does not
+    # immediately classify GPUs as dormant before any user job arrives.
     startup_ts = time.time()
     for gid in args.gpu_ids:
-        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (startup_ts, gid, 1))
+        _touch_last_activity(conn, gid, startup_ts)
         ensure_placeholder_worker(gid)
+    conn.commit()
+    _prune_activity_history(conn, startup_ts)
     conn.commit()
 
     log.info(
@@ -240,6 +269,11 @@ def cmd_guard(argv: list[str]) -> int:
         "on" if args.placeholder_load else "off",
         max(args.placeholder_idle_s, 0.0),
     )
+    for gid in args.gpu_ids:
+        if gpu_has_our_activity(lock_root, gid):
+            continue
+        activate_placeholder_worker(gid, "guard startup idle")
+
     try:
         while True:
             for gid in args.gpu_ids:
@@ -293,9 +327,8 @@ def cmd_guard(argv: list[str]) -> int:
                 our_active = gpu_has_our_activity(lock_root, gid)
                 recent_pulse = _has_recent_pulse(last_pulse_ts, gid, 3.0)
 
-                conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (time.time(), gid, int(our_active)))
-
                 if our_active:
+                    _touch_last_activity(conn, gid, time.time())
                     if ph_alive:
                         park_placeholder_worker(gid, "our process/lock detected")
                     idle_since.pop(gid, None)
@@ -322,11 +355,13 @@ def cmd_guard(argv: list[str]) -> int:
                         log.info("gpu%d: dormant (no user activity for %ds)", gid, args.idle_timeout)
 
             conn.commit()
-            clean_counter += 1
-            if clean_counter >= 3600:  # prune old records every ~1 hour
-                conn.execute("DELETE FROM gpu_activity WHERE ts<?", (time.time() - 7200,))
+            now_ts = time.time()
+            if now_ts - last_history_prune_ts >= 86400.0:
+                deleted = _prune_activity_history(conn, now_ts)
                 conn.commit()
-                clean_counter = 0
+                last_history_prune_ts = now_ts
+                if deleted > 0:
+                    log.info("pruned %d gpu_activity rows older than 24h", deleted)
             time.sleep(1)
     finally:
         cleanup()

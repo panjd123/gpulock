@@ -78,8 +78,10 @@ $(python -c 'import sys; print(sys.executable)') -m supervisor.supervisorctl \
 - 每秒轮询 `nvidia-smi`，无自有任务/锁时 `activate` 一个常驻 placeholder worker，进程名伪装为 `tensorrt_engine_cache`，占 ~85% 显存。
 - 默认会 `CUDAGraph replay` 一段约 45ms 的 GEMM（自动按显卡校准），保持 `util>0` 防被认为空闲；`--no-placeholder-load` 可只占显存。
 - `gpulock perf/check` 一被调用就写 activity pulse + SQLite，guard 立刻 `park` placeholder 让出 GPU。
+- guard / service 刚启动时，只要没检测到 gpulock 自有任务/锁，就会立刻启动并 `activate` placeholder；不需要先等 `placeholder_idle_s`。
+- `--placeholder-idle-s` 控制的是 guard 运行期间，placeholder 被让出后，GPU 再次空闲多久才重新 `activate`。
 - `--idle-timeout`（默认 5400s = 90 分钟）无活动后进入 dormant，彻底释放显存；新活动到达自动复活。
-- 活动持久化到 `${lock_root}/guard.db`，重启 guard 不会丢近期记录。
+- 活动状态与历史分离持久化到 `${lock_root}/guard.db`：`last_activity` 用于 dormant 判定，`gpu_activity` 仅保留近 24 小时历史用于排查。
 
 ## 写进 AGENTS.md 的约定
 
@@ -108,7 +110,7 @@ $(python -c 'import sys; print(sys.executable)') -m supervisor.supervisorctl \
 ${lock_root}/
 ├── gpu<N>/{write.lock, readers/, queue/, placeholder.pid, placeholder.sock, activity.pulse}
 ├── guard.log         # guard 日志（rotating，20MB × 5）
-├── guard.db          # 活动历史
+├── guard.db          # 活动状态 + 近 24h 活动历史
 ├── gpulock.log       # 包装命令日志
 └── service/
     ├── config.json        # gpulock 自己维护的运行时配置
