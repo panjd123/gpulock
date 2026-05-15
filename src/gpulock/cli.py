@@ -69,7 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--set-cuda-visible-devices",
         action="store_true",
-        help="Export CUDA_VISIBLE_DEVICES=<gpu_id> for the child command.",
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -97,6 +97,16 @@ def _rewrite_argv_mode_alias(argv: list[str]) -> list[str]:
         if token in ("--mode", "--perf", "--check"):
             return argv
     return ["--mode", mapped] + prefix[1:] + suffix
+
+
+def _strip_legacy_cuda_visible_flag(argv: list[str]) -> list[str]:
+    try:
+        sep_idx = argv.index("--")
+    except ValueError:
+        sep_idx = len(argv)
+
+    prefix = [token for token in argv[:sep_idx] if token != "--set-cuda-visible-devices"]
+    return prefix + argv[sep_idx:]
 
 
 def _resolve_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
@@ -160,7 +170,7 @@ def main() -> int:
             return 2
 
     parser = _build_parser()
-    args = parser.parse_args(_rewrite_argv_mode_alias(sys.argv[1:]))
+    args = parser.parse_args(_rewrite_argv_mode_alias(_strip_legacy_cuda_visible_flag(sys.argv[1:])))
     mode = _resolve_mode(args, parser)
     log = setup_main_logger(resolve_lock_root())
     log.info(
@@ -217,8 +227,7 @@ def main() -> int:
     child_env = os.environ.copy()
     child_env["GPU_BENCH_LOCKED_DEVICE"] = str(lock.physical_device_id)
     child_env["GPU_BENCH_LOCK_MODE"] = lock.mode
-    if args.set_cuda_visible_devices:
-        child_env["CUDA_VISIBLE_DEVICES"] = str(lock.physical_device_id)
+    child_env["CUDA_VISIBLE_DEVICES"] = str(lock.physical_device_id)
 
     try:
         rc = subprocess.run(command, shell=shell_mode, executable="/bin/bash", env=child_env).returncode

@@ -32,7 +32,7 @@ gpulock perf --wait-gpu-idle 1 -- ./build/operator_benchmark ...
 gpulock check 1 -- python tests/operator_correctness.py
 ```
 
-> `gpulock` **不会** 自动设 `CUDA_VISIBLE_DEVICES`，选卡由 `<cmd>` 自己负责（除非显式加 `--set-cuda-visible-devices`）。
+`gpulock` 会在子进程环境里默认注入 `CUDA_VISIBLE_DEVICES=<锁到的物理 GPU ID>`，所以命令忘记写环境变量时仍会优先使用锁到的卡。这个注入发生在外层环境，命令内部如果自己设置 `CUDA_VISIBLE_DEVICES`，仍会按命令内部的设置执行。
 
 ## 锁语义
 
@@ -94,7 +94,7 @@ $(python -c 'import sys; print(sys.executable)') -m supervisor.supervisorctl \
 2. 默认命令：
    - correctness/功能测试：`gpulock check <gpu_id> -- <command>`
    - perf/benchmark：`gpulock perf <gpu_id> -- <command>`
-   - `gpulock` 不会设 `CUDA_VISIBLE_DEVICES`，选卡由 `<command>` 负责。
+   - `gpulock` 会默认给子进程注入 `CUDA_VISIBLE_DEVICES=<gpu_id>`，但项目脚本仍应保留自己的显式选卡设置，以便脱离 gpulock 运行时也尽量保持正确。
 3. 性能异常先排资源竞争，再判断算子退化。
 4. 跑 perf 前确认 GPU 没有外部占用；如有干扰先做 correctness、等空闲再 perf。
 5. 测试流程必须由主 agent 执行，避免子 agent 抢 GPU 或失控。

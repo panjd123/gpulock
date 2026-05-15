@@ -184,7 +184,7 @@ remaining = sorted((LOCK_ROOT / "gpu99" / "readers").glob("*.lock"))
 check("readers dir cleaned after release", remaining == [], f"remaining={remaining}")
 
 
-print("\n=== gpulock service install --no-start / status / uninstall (no daemon) ===")
+print("\n=== gpulock command env injection ===")
 env = os.environ.copy()
 env["GPU_BENCH_LOCK_DIR"] = str(LOCK_ROOT)
 env["PYTHONPATH"] = str(REPO / "src")
@@ -198,6 +198,31 @@ def run_cli(args: list[str], timeout: int = 20) -> tuple[int, str, str]:
     return p.returncode, p.stdout, p.stderr
 
 
+rc, out, err = run_cli([
+    "check",
+    "99",
+    "--",
+    sys.executable,
+    "-c",
+    "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES', '<missing>'))",
+])
+check("wrapped command rc=0", rc == 0, f"rc={rc} stderr={err.strip()} stdout={out.strip()}")
+check("wrapped command sees CUDA_VISIBLE_DEVICES", "99" in out.splitlines(), out.strip())
+
+rc, out, err = run_cli([
+    "check",
+    "99",
+    "--set-cuda-visible-devices",
+    "--",
+    sys.executable,
+    "-c",
+    "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES', '<missing>'))",
+])
+check("legacy --set-cuda-visible-devices still accepted", rc == 0, f"rc={rc} stderr={err.strip()}")
+check("legacy flag path sees CUDA_VISIBLE_DEVICES", "99" in out.splitlines(), out.strip())
+
+
+print("\n=== gpulock service install --no-start / status / uninstall (no daemon) ===")
 service_dir = LOCK_ROOT / "service"
 if service_dir.exists():
     shutil.rmtree(service_dir)

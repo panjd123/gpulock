@@ -60,7 +60,8 @@ For performance-sensitive work, prefer trusting `gpulock perf` to obtain the exc
 
 ## Practical reminders
 
-- `gpulock` does not set `CUDA_VISIBLE_DEVICES` unless explicitly requested with its CLI option, so the wrapped command still needs to select the intended GPU correctly.
+- `gpulock` injects `CUDA_VISIBLE_DEVICES=<gpu_id>` into the wrapped command by default, as an outer-environment fallback.
+- Do not remove explicit `CUDA_VISIBLE_DEVICES` handling from project scripts just because `gpulock` injects it. Those scripts may also run in environments without `gpulock`, where their own GPU selection is still needed for correctness.
 - If a task is read-only or correctness-oriented, prefer `gpulock check`.
 - If a task is performance-sensitive or requires exclusive access, prefer `gpulock perf`.
 - If a task must wait for coordinated access, let `gpulock` handle the waiting and queueing.
