@@ -12,16 +12,16 @@ gpulock service start                       # 显式启动 guard
 
 `install.sh` 只做两件事，没有任何参数：
 
-1. 安装 Python 包本体（`uv tool install -e . --force --reinstall --refresh`；找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`），并显式安装 placeholder 依赖的 PyTorch CUDA wheel。默认优先尝试 CUDA 12 wheel，并按候选列表 fallback，兼容 x86_64 Linux 和 aarch64 Linux 上 wheel 覆盖不一致的情况。
+1. 安装 Python 包本体（`uv tool install -e . --force --reinstall --refresh`；找不到 `uv` 才回退到 `python3 -m pip install --user --editable .`），并显式安装 placeholder 依赖的 PyTorch CUDA wheel。默认用 `nvidia-smi` 探测最高 GPU compute capability，再生成候选列表 fallback：例如 GB200 / `sm100` 优先 `cu129`，Hopper / `sm90` 优先 `cu124`。
 2. `gpulock service install --no-start`：写 `${lock_root}/service/{config.json,supervisord.conf}`，**不启动**
 
-这样做是为了避免 `pip install torch` / 默认 `uv` 解析到当前平台不可用的 CUDA wheel，导致安装或 placeholder 启动失败。guard 由 [supervisord](https://supervisord.org/)（PyPI `supervisor` 包）托管，裸机和容器一视同仁，不再有 backend 选择。只想要包不要 service：直接执行 `uv tool install -e . --with torch==2.9.1 --torch-backend cu126`，或按机器情况调整 `torch` 版本和 backend。
+这样做是为了避免 `pip install torch` / 默认 `uv` 解析到当前平台不可用或缺少目标 GPU kernel 的 CUDA wheel，导致安装或 placeholder 启动失败。guard 由 [supervisord](https://supervisord.org/)（PyPI `supervisor` 包）托管，裸机和容器一视同仁，不再有 backend 选择。只想要包不要 service：直接执行 `uv tool install -e . --with torch==2.9.1 --torch-backend cu129`，或按机器情况调整 `torch` 版本和 backend。
 
 可覆盖的安装变量：
 
 ```bash
-GPULOCK_TORCH_CANDIDATES="2.9.1:cu126 2.9.1:cu128 2.7.1:cu128" ./install.sh
-GPULOCK_TORCH_VERSION=2.9.1 GPULOCK_TORCH_BACKEND=cu126 ./install.sh
+GPULOCK_TORCH_CANDIDATES="2.9.1:cu129 2.9.1:cu130 2.9.1:cu128" ./install.sh
+GPULOCK_TORCH_VERSION=2.9.1 GPULOCK_TORCH_BACKEND=cu129 ./install.sh
 ```
 
 ## 用法
