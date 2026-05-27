@@ -222,6 +222,51 @@ check("legacy --set-cuda-visible-devices still accepted", rc == 0, f"rc={rc} std
 check("legacy flag path sees CUDA_VISIBLE_DEVICES", "99" in out.splitlines(), out.strip())
 
 
+print("\n=== multi-GPU locking ===")
+
+# Multi-GPU read lock via API
+multi_lock_a = lock.GpuBenchLock(physical_device_id=98, mode="read",
+                                 config=config.LockConfig(timeout_s=5), register_signals=False)
+multi_lock_b = lock.GpuBenchLock(physical_device_id=99, mode="read",
+                                 config=config.LockConfig(timeout_s=5), register_signals=False)
+multi_lock_a.acquire()
+multi_lock_b.acquire()
+check("multi-GPU read lock A acquired", multi_lock_a.fd is not None)
+check("multi-GPU read lock B acquired", multi_lock_b.fd is not None)
+multi_lock_b.release()
+multi_lock_a.release()
+check("multi-GPU read lock B released", multi_lock_b.fd is None)
+check("multi-GPU read lock A released", multi_lock_a.fd is None)
+
+# Multi-GPU write lock via API
+multi_wlock_a = lock.GpuBenchLock(physical_device_id=98, mode="write",
+                                  config=config.LockConfig(timeout_s=5), register_signals=False)
+multi_wlock_b = lock.GpuBenchLock(physical_device_id=99, mode="write",
+                                  config=config.LockConfig(timeout_s=5), register_signals=False)
+multi_wlock_a.acquire()
+multi_wlock_b.acquire()
+check("multi-GPU write lock A acquired", multi_wlock_a.fd is not None)
+check("multi-GPU write lock B acquired", multi_wlock_b.fd is not None)
+check("multi-GPU write lock files exist",
+      (LOCK_ROOT / "gpu98" / "write.lock").exists() and (LOCK_ROOT / "gpu99" / "write.lock").exists())
+multi_wlock_b.release()
+multi_wlock_a.release()
+check("multi-GPU write lock files cleaned",
+      not (LOCK_ROOT / "gpu98" / "write.lock").exists() and not (LOCK_ROOT / "gpu99" / "write.lock").exists())
+
+# Multi-GPU via CLI (comma-separated)
+rc, out, err = run_cli([
+    "check",
+    "98,99",
+    "--",
+    sys.executable,
+    "-c",
+    "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES', '<missing>'))",
+])
+check("multi-GPU CLI rc=0", rc == 0, f"rc={rc} stderr={err.strip()} stdout={out.strip()}")
+check("multi-GPU CLI sets CUDA_VISIBLE_DEVICES=98,99", "98,99" in out, out.strip())
+
+
 print("\n=== gpulock service install --no-start / status / uninstall (no daemon) ===")
 service_dir = LOCK_ROOT / "service"
 if service_dir.exists():

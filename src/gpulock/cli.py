@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -34,7 +36,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Lock mode. write=exclusive (performance); read=shared (correctness/functional).",
     )
-    parser.add_argument("gpu_id", type=int, help="Physical GPU index to lock (nvidia-smi index).")
+    parser.add_argument("gpu_ids", type=str, help="GPU indices: single int or comma-separated (e.g. 0,1,2).")
     parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -128,9 +130,9 @@ def _resolve_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 def _normalize_command(raw: list[str]) -> tuple[str, bool]:
     if not raw:
         raise ValueError(
-            "Missing command. Usage: gpulock perf <gpu_id> -- <cmd> "
-            "or gpulock check <gpu_id> -- <cmd> "
-            "or gpulock [--mode read|write] <gpu_id> -- <cmd>"
+            "Missing command. Usage: gpulock perf <gpu_ids> -- <cmd> "
+            "or gpulock check <gpu_ids> -- <cmd> "
+            "or gpulock [--mode read|write] <gpu_ids> -- <cmd>"
         )
     if raw[0] == "--":
         raw = raw[1:]
@@ -141,11 +143,20 @@ def _normalize_command(raw: list[str]) -> tuple[str, bool]:
     return (" ".join(shlex.quote(x) for x in raw), True)
 
 
+def _parse_gpu_ids(raw: str) -> list[int]:
+    """Parse '0,1,2' or '0' into sorted deduplicated list of GPU IDs."""
+    parts = raw.replace(" ", "").split(",")
+    ids = sorted(set(int(p) for p in parts if p))
+    if not ids:
+        raise ValueError("No valid GPU IDs provided")
+    return ids
+
+
 def main() -> int:
     prog = os.path.basename(sys.argv[0])
     if prog == "gpuunlock":
         print(
-            "[gpulock] 'gpuunlock' has been removed. Use wrapped execution only: gpulock perf/check <gpu_id> -- <cmd>",
+            "[gpulock] 'gpuunlock' has been removed. Use wrapped execution only: gpulock perf/check <gpu_ids> -- <cmd>",
             file=sys.stderr,
         )
         return 2
@@ -164,7 +175,7 @@ def main() -> int:
         if sub in ("lock", "unlock", "release"):
             print(
                 "[gpulock] standalone lock/unlock has been removed to avoid leaked locks. "
-                "Use wrapped execution only: gpulock perf/check <gpu_id> -- <cmd>",
+                "Use wrapped execution only: gpulock perf/check <gpu_ids> -- <cmd>",
                 file=sys.stderr,
             )
             return 2
@@ -173,10 +184,18 @@ def main() -> int:
     args = parser.parse_args(_rewrite_argv_mode_alias(_strip_legacy_cuda_visible_flag(sys.argv[1:])))
     mode = _resolve_mode(args, parser)
     log = setup_main_logger(resolve_lock_root())
+
+    try:
+        gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    except ValueError as e:
+        print(f"[gpulock] {e}", file=sys.stderr)
+        return 2
+
+    gpu_ids_str = ",".join(str(g) for g in gpu_ids)
     log.info(
-        "cmd run request mode=%s gpu=%d wait_gpu_idle=%s idle_streak=%d idle_check_ms=%d argv=%s",
+        "cmd run request mode=%s gpus=%s wait_gpu_idle=%s idle_streak=%d idle_check_ms=%d argv=%s",
         mode,
-        args.gpu_id,
+        gpu_ids_str,
         bool(args.wait_gpu_idle),
         max(args.idle_streak_s, 1),
         max(args.idle_check_ms, 100),
@@ -194,56 +213,78 @@ def main() -> int:
     try:
         command, shell_mode = _normalize_command(args.command)
     except ValueError as e:
-        log.error("cmd run invalid command gpu=%d mode=%s err=%s", args.gpu_id, mode, e)
+        log.error("cmd run invalid command gpus=%s mode=%s err=%s", gpu_ids_str, mode, e)
         print(f"[gpulock] {e}", file=sys.stderr)
         return 2
-    log.info("cmd run child command gpu=%d mode=%s shell=%s cmd=%s", args.gpu_id, mode, shell_mode, command)
+    log.info("cmd run child command gpus=%s mode=%s shell=%s cmd=%s", gpu_ids_str, mode, shell_mode, command)
 
-    lock = GpuBenchLock(
-        args.gpu_id,
-        mode=mode,
-        config=cfg,
-        wait_gpu_idle=bool(args.wait_gpu_idle),
-        idle_streak_s=max(args.idle_streak_s, 1),
-        idle_check_ms=max(args.idle_check_ms, 100),
-    )
+    # Acquire locks in ascending GPU ID order to avoid deadlock.
+    locks: list[GpuBenchLock] = []
     try:
-        lock.acquire()
+        for gid in gpu_ids:
+            lock = GpuBenchLock(
+                gid,
+                mode=mode,
+                config=cfg,
+                wait_gpu_idle=bool(args.wait_gpu_idle),
+                idle_streak_s=max(args.idle_streak_s, 1),
+                idle_check_ms=max(args.idle_check_ms, 100),
+                register_signals=False,
+            )
+            lock.acquire()
+            locks.append(lock)
     except TimeoutError as e:
-        log.error("cmd run lock timeout gpu=%d mode=%s err=%s", args.gpu_id, mode, e)
+        for lk in reversed(locks):
+            lk.release()
+        log.error("cmd run lock timeout gpus=%s mode=%s err=%s", gpu_ids_str, mode, e)
         print(f"[GPU Lock] timeout: {e}", file=sys.stderr)
         return 124
     except Exception as e:
-        log.exception("cmd run lock acquire failed gpu=%d mode=%s err=%s", args.gpu_id, mode, e)
+        for lk in reversed(locks):
+            lk.release()
+        log.exception("cmd run lock acquire failed gpus=%s mode=%s err=%s", gpu_ids_str, mode, e)
         print(f"[GPU Lock] acquire failed: {e}", file=sys.stderr)
         return 1
 
-    path_str = str(lock.lock_path) if lock.lock_path is not None else ""
+    # Register unified signal/atexit handlers for all locks.
+    def _release_all() -> None:
+        for lk in reversed(locks):
+            lk.release()
+
+    def _signal_handler(signum, _frame):
+        _release_all()
+        os._exit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, _signal_handler)
+    atexit.register(_release_all)
+
+    lock_paths_str = " ".join(str(lk.lock_path) for lk in locks if lk.lock_path)
     print(
-        f"[GPU Lock] acquired mode={lock.mode} device={lock.physical_device_id} lock_path={path_str}",
+        f"[GPU Lock] acquired mode={mode} devices={gpu_ids_str} lock_paths={lock_paths_str}",
         flush=True,
     )
 
     child_env = os.environ.copy()
-    child_env["GPU_BENCH_LOCKED_DEVICE"] = str(lock.physical_device_id)
-    child_env["GPU_BENCH_LOCK_MODE"] = lock.mode
-    child_env["CUDA_VISIBLE_DEVICES"] = str(lock.physical_device_id)
+    child_env["GPU_BENCH_LOCKED_DEVICE"] = gpu_ids_str
+    child_env["GPU_BENCH_LOCK_MODE"] = mode
+    child_env["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
 
     try:
         rc = subprocess.run(command, shell=shell_mode, executable="/bin/bash", env=child_env).returncode
     except KeyboardInterrupt:
         rc = 130
-        log.warning("cmd run interrupted gpu=%d mode=%s rc=%d", args.gpu_id, mode, rc)
+        log.warning("cmd run interrupted gpus=%s mode=%s rc=%d", gpu_ids_str, mode, rc)
     except Exception as e:
-        log.exception("cmd run child failed gpu=%d mode=%s err=%s", args.gpu_id, mode, e)
+        log.exception("cmd run child failed gpus=%s mode=%s err=%s", gpu_ids_str, mode, e)
         rc = 1
     finally:
-        lock.release()
+        _release_all()
         print(
-            f"[GPU Lock] released mode={lock.mode} device={lock.physical_device_id}",
+            f"[GPU Lock] released mode={mode} devices={gpu_ids_str}",
             flush=True,
         )
-    log.info("cmd run finished gpu=%d mode=%s rc=%d", args.gpu_id, mode, rc)
+    log.info("cmd run finished gpus=%s mode=%s rc=%d", gpu_ids_str, mode, rc)
 
     return int(rc)
 

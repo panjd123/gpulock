@@ -116,6 +116,7 @@ class GpuBenchLock:
         wait_gpu_idle: bool = False,
         idle_streak_s: int = 3,
         idle_check_ms: int = 100,
+        register_signals: bool = True,
     ):
         if mode not in (READ_MODE, WRITE_MODE):
             raise ValueError(f"Unsupported mode: {mode}")
@@ -139,6 +140,7 @@ class GpuBenchLock:
         self.idle_streak_s = max(int(idle_streak_s), 1)
         self.idle_check_ms = max(int(idle_check_ms), 100)
 
+        self._register_signals = register_signals
         self._stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._old_handlers: dict[int, signal.Handlers] = {}  # type: ignore[name-defined]
@@ -546,7 +548,8 @@ class GpuBenchLock:
                     if blocked_reason == "":
                         self._unregister_queue_request_locked()
                         self._start_heartbeat()
-                        self._register_signal_cleanup()
+                        if self._register_signals:
+                            self._register_signal_cleanup()
                         log.info(
                             "lock acquired gpu=%d mode=%s lock_path=%s",
                             self.physical_device_id,
