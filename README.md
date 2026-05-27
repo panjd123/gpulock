@@ -27,9 +27,11 @@ GPULOCK_TORCH_VERSION=2.9.1 GPULOCK_TORCH_BACKEND=cu129 ./install.sh
 ## 用法
 
 ```bash
-gpulock perf  <gpu_id> -- <cmd>     # 写锁，独占（性能/benchmark）
-gpulock check <gpu_id> -- <cmd>     # 读锁，可并发（功能/correctness）
+gpulock perf  <gpu_ids> -- <cmd>     # 写锁，独占（性能/benchmark）
+gpulock check <gpu_ids> -- <cmd>     # 读锁，可并发（功能/correctness）
 ```
+
+`<gpu_ids>` 可以是单个整数（如 `0`）或逗号分隔列表（如 `0,1,2`），支持多卡锁定。多卡模式下按 GPU ID 升序依次获取锁以避免死锁，任一卡获取失败会自动回滚已获取的锁。
 
 例子：
 
@@ -37,9 +39,11 @@ gpulock check <gpu_id> -- <cmd>     # 读锁，可并发（功能/correctness）
 gpulock perf 1 -- ./build/operator_benchmark --case matmul_fp16 --size 4096
 gpulock perf --wait-gpu-idle 1 -- ./build/operator_benchmark ...
 gpulock check 1 -- python tests/operator_correctness.py
+gpulock perf 0,1 -- python train_multi_gpu.py         # 多卡
+gpulock check 0,1,2,3 -- python test_distributed.py   # 多卡
 ```
 
-`gpulock` 会在子进程环境里默认注入 `CUDA_VISIBLE_DEVICES=<锁到的物理 GPU ID>`，所以命令忘记写环境变量时仍会优先使用锁到的卡。这个注入发生在外层环境，命令内部如果自己设置 `CUDA_VISIBLE_DEVICES`，仍会按命令内部的设置执行。
+`gpulock` 会在子进程环境里默认注入 `CUDA_VISIBLE_DEVICES=<锁到的物理 GPU ID>`（多卡时为逗号分隔列表如 `0,1,2`），所以命令忘记写环境变量时仍会优先使用锁到的卡。这个注入发生在外层环境，命令内部如果自己设置 `CUDA_VISIBLE_DEVICES`，仍会按命令内部的设置执行。
 
 ## 锁语义
 
@@ -99,9 +103,10 @@ $(python -c 'import sys; print(sys.executable)') -m supervisor.supervisorctl \
 
 1. 多任务并发环境必须优先用 `gpulock`，避免 GPU 资源争抢。
 2. 默认命令：
-   - correctness/功能测试：`gpulock check <gpu_id> -- <command>`
-   - perf/benchmark：`gpulock perf <gpu_id> -- <command>`
-   - `gpulock` 会默认给子进程注入 `CUDA_VISIBLE_DEVICES=<gpu_id>`，但项目脚本仍应保留自己的显式选卡设置，以便脱离 gpulock 运行时也尽量保持正确。
+   - correctness/功能测试：`gpulock check <gpu_ids> -- <command>`
+   - perf/benchmark：`gpulock perf <gpu_ids> -- <command>`
+   - `<gpu_ids>` 可以是单个整数或逗号分隔列表（如 `0,1,2`）。
+   - `gpulock` 会默认给子进程注入 `CUDA_VISIBLE_DEVICES=<gpu_ids>`，但项目脚本仍应保留自己的显式选卡设置，以便脱离 gpulock 运行时也尽量保持正确。
 3. 性能异常先排资源竞争，再判断算子退化。
 4. 跑 perf 前确认 GPU 没有外部占用；如有干扰先做 correctness、等空闲再 perf。
 5. 测试流程必须由主 agent 执行，避免子 agent 抢 GPU 或失控。
@@ -158,8 +163,8 @@ ${lock_root}/
 下面这些写法等价，老脚本不用改：
 
 ```bash
-gpulock --mode write <gpu_id> -- <cmd>
-gpulock --mode read  <gpu_id> -- <cmd>
-gpulock --perf       <gpu_id> -- <cmd>
-gpulock --check      <gpu_id> -- <cmd>
+gpulock --mode write <gpu_ids> -- <cmd>
+gpulock --mode read  <gpu_ids> -- <cmd>
+gpulock --perf       <gpu_ids> -- <cmd>
+gpulock --check      <gpu_ids> -- <cmd>
 ```

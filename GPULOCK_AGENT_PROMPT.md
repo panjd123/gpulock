@@ -8,8 +8,10 @@ It is not the `AGENTS.md` for the `gpulock` repository itself. Instead, copy or 
 
 Use `gpulock` for all GPU commands in this workspace.
 
-- correctness / validation / functional tests: `gpulock check <gpu_id> -- <command>`
-- performance / benchmark / profiling: `gpulock perf <gpu_id> -- <command>`
+- correctness / validation / functional tests: `gpulock check <gpu_ids> -- <command>`
+- performance / benchmark / profiling: `gpulock perf <gpu_ids> -- <command>`
+
+`<gpu_ids>` can be a single integer (e.g. `0`) or comma-separated list (e.g. `0,1,2`) for multi-GPU workloads.
 
 Do not run raw GPU commands directly unless the user explicitly asks to bypass `gpulock`.
 
@@ -60,7 +62,7 @@ For performance-sensitive work, prefer trusting `gpulock perf` to obtain the exc
 
 ## Practical reminders
 
-- `gpulock` injects `CUDA_VISIBLE_DEVICES=<gpu_id>` into the wrapped command by default, as an outer-environment fallback.
+- `gpulock` injects `CUDA_VISIBLE_DEVICES=<gpu_ids>` into the wrapped command by default, as an outer-environment fallback. For multi-GPU jobs this will be a comma-separated list (e.g. `0,1,2`).
 - Do not remove explicit `CUDA_VISIBLE_DEVICES` handling from project scripts just because `gpulock` injects it. Those scripts may also run in environments without `gpulock`, where their own GPU selection is still needed for correctness.
 - If a task is read-only or correctness-oriented, prefer `gpulock check`.
 - If a task is performance-sensitive or requires exclusive access, prefer `gpulock perf`.
