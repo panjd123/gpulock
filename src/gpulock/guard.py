@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from .gpu import gpu_indices, kill_visible_placeholder_compute_pids
+from .gpu import gpu_indices, gpu_runtime_state_by_index, kill_visible_placeholder_compute_pids
 from .lock import gpu_has_our_activity
 from .logging_setup import setup_guard_logger
 from .paths import read_lock_metadata, resolve_lock_root
@@ -272,6 +272,10 @@ def cmd_guard(argv: list[str]) -> int:
     for gid in args.gpu_ids:
         if gpu_has_our_activity(lock_root, gid):
             continue
+        # Don't activate placeholder if non-placeholder processes are using GPU.
+        rt = gpu_runtime_state_by_index(gid)
+        if rt is not None and rt.visible_non_placeholder_pids > 0:
+            continue
         activate_placeholder_worker(gid, "guard startup idle")
 
     try:
@@ -345,9 +349,16 @@ def cmd_guard(argv: list[str]) -> int:
                     if recent_pulse:
                         idle_since[gid] = now
                     elif now - idle_since[gid] >= max(args.placeholder_idle_s, 0.0):
-                        activate_placeholder_worker(gid, "gpu idle")
-                        if gid in placeholder_active:
-                            idle_since.pop(gid, None)
+                        # Do not reactivate placeholder if non-placeholder processes
+                        # are actively using this GPU (e.g. training outlived its
+                        # gpulock wrapper).
+                        rt = gpu_runtime_state_by_index(gid)
+                        if rt is not None and rt.visible_non_placeholder_pids > 0:
+                            idle_since[gid] = now  # reset idle timer
+                        else:
+                            activate_placeholder_worker(gid, "gpu idle")
+                            if gid in placeholder_active:
+                                idle_since.pop(gid, None)
                     if ph_alive and gid in placeholder_active and not _has_recent_activity(conn, gid, args.idle_timeout):
                         park_placeholder_worker(gid, f"no user activity for {args.idle_timeout}s")
                         dormant.add(gid)

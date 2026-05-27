@@ -197,6 +197,12 @@ def gpu_busy_reason_for_perf(index: int) -> tuple[bool, str]:
         f"visible_compute_pids={state.visible_compute_pids} "
         f"visible_non_placeholder_pids={state.visible_non_placeholder_pids}"
     )
+    # If the only compute processes are placeholders, the GPU is not considered
+    # busy — the placeholder will be (or has been) parked before the lock is used.
+    # Residual utilization from a recently-parked placeholder should not block
+    # write lock acquisition.
+    if state.visible_non_placeholder_pids == 0:
+        return (False, f"{summary} idle_by=placeholder_only")
     if state.util_gpu > 0:
         return (True, f"{summary} busy_by=util={state.util_gpu}%")
     return (False, f"{summary} idle_by=util=0")
