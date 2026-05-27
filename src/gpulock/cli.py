@@ -181,7 +181,20 @@ def main() -> int:
             return 2
 
     parser = _build_parser()
-    args = parser.parse_args(_rewrite_argv_mode_alias(_strip_legacy_cuda_visible_flag(sys.argv[1:])))
+    raw_argv = _rewrite_argv_mode_alias(_strip_legacy_cuda_visible_flag(sys.argv[1:]))
+    # Split at first '--' BEFORE argparse to prevent REMAINDER from swallowing
+    # gpulock flags that appear between gpu_ids and '--'. Only pass the prefix
+    # to argparse; the user command (after '--') is handled manually.
+    try:
+        sep_idx = raw_argv.index("--")
+        gpulock_argv = raw_argv[:sep_idx]
+        user_cmd = raw_argv[sep_idx:]  # includes the '--'
+        args = parser.parse_args(gpulock_argv)
+        # Override the command attribute with the manually-separated user command.
+        args.command = user_cmd
+    except ValueError:
+        # No '--' separator: let argparse REMAINDER handle it as before.
+        args = parser.parse_args(raw_argv)
     mode = _resolve_mode(args, parser)
     log = setup_main_logger(resolve_lock_root())
 

@@ -216,10 +216,21 @@ def kill_visible_placeholder_compute_pids(index: int) -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             continue
+        # Wait up to 2s for SIGTERM to take effect.
         for _ in range(20):
             if not pid_exists(pid):
                 break
             time.sleep(0.1)
+        else:
+            # SIGTERM didn't work; escalate to SIGKILL.
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            for _ in range(30):
+                if not pid_exists(pid):
+                    break
+                time.sleep(0.1)
 
 
 def pid_exists(pid: int) -> bool:
