@@ -12,7 +12,7 @@ from .config import env_bool, env_int
 
 
 def resolve_log_level(default: str = "INFO") -> int:
-    raw = os.getenv("GPU_BENCH_LOG_LEVEL", default).strip().upper()
+    raw = os.getenv("GPULOCK_LOG_LEVEL", default).strip().upper()
     return getattr(logging, raw, logging.INFO)
 
 
@@ -38,8 +38,8 @@ def setup_rotating_logger(
         sh.setFormatter(fmt)
         logger.addHandler(sh)
 
-    max_bytes = env_int("GPU_BENCH_LOG_MAX_BYTES", 20 * 1024 * 1024, minimum=1024)
-    backup_count = env_int("GPU_BENCH_LOG_BACKUP_COUNT", 5, minimum=1)
+    max_bytes = env_int("GPULOCK_LOG_MAX_BYTES", 20 * 1024 * 1024, minimum=1024)
+    backup_count = env_int("GPULOCK_LOG_BACKUP_COUNT", 5, minimum=1)
     log_path = lock_root / filename
     fh = RotatingFileHandler(str(log_path), maxBytes=max_bytes, backupCount=backup_count)
     fh.setFormatter(fmt)
@@ -48,7 +48,7 @@ def setup_rotating_logger(
 
 
 def setup_guard_logger(lock_root: Path) -> logging.Logger:
-    to_stdout = env_bool("GPU_BENCH_GUARD_LOG_STDOUT", True)
+    to_stdout = env_bool("GPULOCK_GUARD_LOG_STDOUT", True)
     return setup_rotating_logger(
         lock_root,
         name="gpulock.guard",
@@ -58,7 +58,7 @@ def setup_guard_logger(lock_root: Path) -> logging.Logger:
 
 
 def setup_main_logger(lock_root: Path) -> logging.Logger:
-    to_stdout = env_bool("GPU_BENCH_LOG_STDOUT", False)
+    to_stdout = env_bool("GPULOCK_LOG_STDOUT", False)
     return setup_rotating_logger(
         lock_root,
         name="gpulock.main",

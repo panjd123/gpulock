@@ -26,6 +26,7 @@ from .placeholder import (
     stop_placeholder,
     wait_placeholder_ready,
 )
+from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S, DEFAULT_PLACEHOLDER_LOAD
 
 
 def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
@@ -55,7 +56,11 @@ def _record_activity_event(conn: sqlite3.Connection, gpu_id: int, ts: float) -> 
     _touch_last_activity(conn, gpu_id, ts)
 
 
-def _has_recent_activity(conn: sqlite3.Connection, gpu_id: int, window_s: float = 5400) -> bool:
+def _has_recent_activity(
+    conn: sqlite3.Connection,
+    gpu_id: int,
+    window_s: float = DEFAULT_IDLE_TIMEOUT,
+) -> bool:
     row = conn.execute(
         "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
         (gpu_id,),
@@ -80,6 +85,10 @@ def _has_recent_pulse(last_pulse_ts: dict[int, float], gpu_id: int, window_s: fl
     return ts > 0.0 and (time.time() - ts) <= max(window_s, 0.0)
 
 
+def _guard_poll_interval_s(placeholder_idle_s: float) -> float:
+    return min(max(float(placeholder_idle_s) / 2.0, 0.05), 0.5)
+
+
 def _resolve_guard_gpu_ids(requested_gpu_ids: list[int]) -> list[int]:
     if not requested_gpu_ids:
         return gpu_indices()
@@ -100,15 +109,15 @@ def cmd_guard(argv: list[str]) -> int:
         help="GPU IDs to watch (default: all visible GPUs)",
     )
     parser.add_argument(
-        "--idle-timeout", type=int, default=5400,
-        help="seconds without user activity before releasing placeholder (default 5400)",
+        "--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT,
+        help=f"seconds without user activity before releasing placeholder (default {DEFAULT_IDLE_TIMEOUT})",
     )
     parser.add_argument(
-        "--placeholder-idle-s", type=float, default=0.0,
-        help="seconds of GPU idleness before spawning placeholder (default 0.0)",
+        "--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S,
+        help=f"seconds of GPU idleness before spawning placeholder (default {DEFAULT_PLACEHOLDER_IDLE_S})",
     )
     parser.add_argument(
-        "--placeholder-load", dest="placeholder_load", action="store_true", default=True,
+        "--placeholder-load", dest="placeholder_load", action="store_true", default=DEFAULT_PLACEHOLDER_LOAD,
         help="keep a compute loop in placeholder so GPU util stays non-zero (default: enabled)",
     )
     parser.add_argument(
@@ -329,7 +338,7 @@ def cmd_guard(argv: list[str]) -> int:
                     placeholder_active.discard(gid)
 
                 our_active = gpu_has_our_activity(lock_root, gid)
-                recent_pulse = _has_recent_pulse(last_pulse_ts, gid, 3.0)
+                recent_pulse = _has_recent_pulse(last_pulse_ts, gid, max(args.placeholder_idle_s, 0.0))
 
                 if our_active:
                     _touch_last_activity(conn, gid, time.time())
@@ -373,6 +382,6 @@ def cmd_guard(argv: list[str]) -> int:
                 last_history_prune_ts = now_ts
                 if deleted > 0:
                     log.info("pruned %d gpu_activity rows older than 24h", deleted)
-            time.sleep(1)
+            time.sleep(_guard_poll_interval_s(args.placeholder_idle_s))
     finally:
         cleanup()

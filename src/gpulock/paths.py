@@ -11,12 +11,12 @@ def resolve_lock_root() -> Path:
     """Resolve the directory we use for all gpulock state.
 
     Order:
-        1. ``GPU_BENCH_LOCK_DIR``
-        2. ``/var/lock/gpu-benchmark``
-        3. ``/tmp/gpu_benchmark_locks``
+        1. ``GPULOCK_LOCK_DIR``
+        2. ``/var/lock/gpulock``
+        3. ``/tmp/gpulock_locks``
     """
 
-    env_root = os.getenv("GPU_BENCH_LOCK_DIR", "").strip()
+    env_root = os.getenv("GPULOCK_LOCK_DIR", "").strip()
     if env_root:
         path = Path(env_root)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -26,7 +26,7 @@ def resolve_lock_root() -> Path:
             pass
         return path
 
-    default_root = Path("/var/lock/gpu-benchmark")
+    default_root = Path("/var/lock/gpulock")
     try:
         default_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -35,7 +35,7 @@ def resolve_lock_root() -> Path:
             pass
         return default_root
     except Exception:
-        fallback_root = Path("/tmp/gpu_benchmark_locks")
+        fallback_root = Path("/tmp/gpulock_locks")
         fallback_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(fallback_root, 0o700)

@@ -1,4 +1,4 @@
-"""GpuBenchLock: per-GPU read/write lock with heartbeats and orphan cleanup."""
+"""Per-GPU read/write lock with heartbeats and stale-lock cleanup."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from .config import LockConfig, ProbeState, READ_MODE, WRITE_MODE
+from .config import LockConfig, READ_MODE, StaleLockProbe, WRITE_MODE
 from .gpu import (
     gpu_busy_reason_for_perf,
     gpu_has_processes_by_index,
@@ -107,7 +107,7 @@ def gpu_has_our_activity(lock_root: Path, gpu_id: int) -> bool:
     return False
 
 
-class GpuBenchLock:
+class GpuLock:
     def __init__(
         self,
         physical_device_id: int,
@@ -145,7 +145,7 @@ class GpuBenchLock:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._old_handlers: dict[int, signal.Handlers] = {}  # type: ignore[name-defined]
         self._registered_atexit = False
-        self._orphan_probe: dict[str, ProbeState] = {}
+        self._stale_probe: dict[str, StaleLockProbe] = {}
         self._queue_request_path: Optional[Path] = None
         self._queue_request_seq: Optional[int] = None
 
@@ -299,53 +299,86 @@ class GpuBenchLock:
                 continue
             req_path.unlink(missing_ok=True)
 
-    def _try_cleanup_zombie_lock(self, lock_path: Path, now_s: float, log: logging.Logger) -> None:
+    def _stale_lock_min_age_s(self, lock_path: Path) -> float:
+        pid = read_lock_pid(lock_path)
+        if pid is None:
+            return float(self.config.grace_age_s)
+        return float(max(self.config.heartbeat_s * 2, 2))
+
+    def _try_cleanup_stale_lock(self, lock_path: Path, now_s: float, log: logging.Logger) -> None:
         try:
             st = lock_path.stat()
         except FileNotFoundError:
+            self._stale_probe.pop(str(lock_path), None)
             return
 
         age_s = now_s - st.st_mtime
-        min_age_s = max(self.config.heartbeat_s * 2, 2)
-        if age_s < min_age_s:
+        if age_s < self._stale_lock_min_age_s(lock_path):
             return
 
         pid = read_lock_pid(lock_path)
-        if pid is None:
-            if age_s < self.config.grace_age_s:
-                return
-        else:
-            if pid_exists(pid):
-                return
+        if pid is not None and pid_exists(pid):
+            self._stale_probe.pop(str(lock_path), None)
+            return
+
+        # A dead gpulock wrapper can leave its child workload alive. Keep the
+        # lock while any compute process is still visible on that GPU.
+        if gpu_has_processes_by_index(self.physical_device_id):
+            self._stale_probe.pop(str(lock_path), None)
+            return
+
+        hb = read_last_heartbeat_ms(lock_path)
+        key = str(lock_path)
+        probe = self._stale_probe.get(key)
+        if probe is None or probe.last_mtime_ns != st.st_mtime_ns or probe.last_hb_ms != hb:
+            self._stale_probe[key] = StaleLockProbe(last_mtime_ns=st.st_mtime_ns, last_hb_ms=hb)
+            return
 
         try:
             st2 = lock_path.stat()
         except FileNotFoundError:
+            self._stale_probe.pop(key, None)
             return
-        if st2.st_mtime_ns != st.st_mtime_ns:
+        hb2 = read_last_heartbeat_ms(lock_path)
+        pid2 = read_lock_pid(lock_path)
+        age2 = time.time() - st2.st_mtime
+        if (
+            st2.st_mtime_ns != st.st_mtime_ns
+            or hb2 != hb
+            or age2 < self._stale_lock_min_age_s(lock_path)
+            or (pid2 is not None and pid_exists(pid2))
+            or gpu_has_processes_by_index(self.physical_device_id)
+        ):
             return
 
         try:
             lock_path.unlink()
         except FileNotFoundError:
             return
+        self._stale_probe.pop(key, None)
         log.warning(
-            "cleaned zombie lock gpu=%d path=%s pid=%s age_s=%.1f",
+            "cleaned stale lock gpu=%d path=%s pid=%s age_s=%.1f",
             self.physical_device_id,
             str(lock_path),
             str(pid) if pid is not None else "?",
             age_s,
         )
 
-    def _cleanup_zombie_locks_locked(self) -> None:
+    def _cleanup_stale_locks_locked(self) -> None:
         log = logging.getLogger("gpulock.main")
         now_s = time.time()
         candidates: list[Path] = []
         if self.writer_path.exists():
             candidates.append(self.writer_path)
         candidates.extend(self._reader_paths_locked())
+
+        seen = {str(p) for p in candidates}
+        for stale_key in list(self._stale_probe.keys()):
+            if stale_key not in seen:
+                self._stale_probe.pop(stale_key, None)
+
         for lock_path in candidates:
-            self._try_cleanup_zombie_lock(lock_path, now_s, log)
+            self._try_cleanup_stale_lock(lock_path, now_s, log)
 
     def _queue_wait_reason_locked(self) -> Optional[str]:
         if self._queue_request_seq is None:
@@ -365,90 +398,6 @@ class GpuBenchLock:
         if earlier_writers:
             return f"queue waiting: {len(earlier_writers)} earlier writer request(s)"
         return None
-
-    def _reset_probe_state(self, lock_path: Path) -> None:
-        self._orphan_probe.pop(str(lock_path), None)
-
-    def _try_cleanup_orphan(self, lock_path: Path, now_s: float) -> None:
-        try:
-            st = lock_path.stat()
-        except FileNotFoundError:
-            self._reset_probe_state(lock_path)
-            return
-
-        age_s = now_s - st.st_mtime
-        if age_s <= self.config.grace_age_s:
-            self._reset_probe_state(lock_path)
-            return
-
-        pid = read_lock_pid(lock_path)
-        if pid is not None and pid_exists(pid):
-            self._reset_probe_state(lock_path)
-            return
-
-        key = str(lock_path)
-        state = self._orphan_probe.setdefault(key, ProbeState())
-        if now_s - state.last_probe_s < self.config.orphan_check_s:
-            return
-        state.last_probe_s = now_s
-
-        if gpu_has_processes_by_index(self.physical_device_id):
-            state.empty_count = 0
-            state.last_mtime_ns = -1
-            state.last_hb_ms = -1
-            return
-
-        hb = read_last_heartbeat_ms(lock_path)
-        mtime_ns = st.st_mtime_ns
-
-        if hb == state.last_hb_ms and mtime_ns == state.last_mtime_ns:
-            state.empty_count += 1
-        else:
-            state.empty_count = 1
-            state.last_hb_ms = hb
-            state.last_mtime_ns = mtime_ns
-
-        if state.empty_count < self.config.orphan_empty_threshold:
-            return
-
-        try:
-            st2 = lock_path.stat()
-        except FileNotFoundError:
-            self._reset_probe_state(lock_path)
-            return
-
-        hb2 = read_last_heartbeat_ms(lock_path)
-        age2 = time.time() - st2.st_mtime
-        pid2 = read_lock_pid(lock_path)
-
-        if (
-            age2 > self.config.grace_age_s
-            and hb2 == state.last_hb_ms
-            and st2.st_mtime_ns == state.last_mtime_ns
-            and (pid2 is None or not pid_exists(pid2))
-            and not gpu_has_processes_by_index(self.physical_device_id)
-        ):
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-
-        self._reset_probe_state(lock_path)
-
-    def _cleanup_orphans_locked(self) -> None:
-        now_s = time.time()
-        candidates: list[Path] = []
-        if self.writer_path.exists():
-            candidates.append(self.writer_path)
-        candidates.extend(self._reader_paths_locked())
-
-        seen = {str(p) for p in candidates}
-        for stale_key in list(self._orphan_probe.keys()):
-            if stale_key not in seen:
-                self._orphan_probe.pop(stale_key, None)
-
-        for lock_path in candidates:
-            self._try_cleanup_orphan(lock_path, now_s)
 
     def _acquire_write_locked(self) -> Optional[str]:
         if self.writer_path.exists():
@@ -530,8 +479,7 @@ class GpuBenchLock:
                 with self._state_gate():
                     self._register_queue_request_locked()
                     self._cleanup_stale_queue_locked()
-                    self._cleanup_zombie_locks_locked()
-                    self._cleanup_orphans_locked()
+                    self._cleanup_stale_locks_locked()
 
                     queue_reason = self._queue_wait_reason_locked()
                     if queue_reason is not None:
@@ -607,7 +555,7 @@ class GpuBenchLock:
         self._restore_signal_handlers()
         log.info("lock released gpu=%d mode=%s lock_path=%s", released_gpu, released_mode, released_path)
 
-    def __enter__(self) -> "GpuBenchLock":
+    def __enter__(self) -> "GpuLock":
         self.acquire()
         return self
 

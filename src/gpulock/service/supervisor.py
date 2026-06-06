@@ -208,8 +208,7 @@ def start() -> int:
         warn(
             f"supervisor package not importable: {err}\n"
             "  reinstall gpulock to pull in the dependency:\n"
-            "    uv tool install -e . --force --reinstall --refresh --with torch==2.7.1 --torch-backend cu118\n"
-            "    # or: ./install.sh"
+            "    uv tool install -e . --force --reinstall --refresh --torch-backend auto"
         )
         return 1
 
@@ -297,7 +296,7 @@ def status() -> int:
     cfg_path = GuardServiceConfig.config_path()
     if not cfg_path.exists():
         print(f"installed:    no  (missing config: {cfg_path})")
-        print("next:         ./install.sh   # or: gpulock service install --no-start")
+        print("next:         gpulock service install --no-start")
         return 4
 
     cfg = GuardServiceConfig.load()

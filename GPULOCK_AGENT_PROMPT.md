@@ -9,7 +9,7 @@ It is not the `AGENTS.md` for the `gpulock` repository itself. Instead, copy or 
 Use `gpulock` for all GPU commands in this workspace.
 
 - correctness / validation / functional tests: `gpulock check <gpu_ids> -- <command>`
-- performance / benchmark / profiling: `gpulock perf <gpu_ids> -- <command>`
+- performance / profiling / exclusive GPU work: `gpulock perf <gpu_ids> -- <command>`
 
 `<gpu_ids>` can be a single integer (e.g. `0`) or comma-separated list (e.g. `0,1,2`) for multi-GPU workloads.
 
@@ -24,7 +24,7 @@ Do not run raw GPU commands directly unless the user explicitly asks to bypass `
 - read locks can run concurrently with other read locks.
 - write locks are exclusive and block both read and write lock holders.
 
-This means correctness-style jobs can share a GPU when that is allowed, while benchmark / profiling jobs can request exclusive access when isolation matters.
+This means correctness-style jobs can share a GPU when that is allowed, while performance or profiling jobs can request exclusive access when isolation matters.
 
 ## Queueing and fairness
 
@@ -67,4 +67,4 @@ For performance-sensitive work, prefer trusting `gpulock perf` to obtain the exc
 - If a task is read-only or correctness-oriented, prefer `gpulock check`.
 - If a task is performance-sensitive or requires exclusive access, prefer `gpulock perf`.
 - If a task must wait for coordinated access, let `gpulock` handle the waiting and queueing.
-- `gpulock` also includes orphan-lock cleanup logic, so agents should not reimplement their own ad hoc lock cleanup unless they are debugging `gpulock` itself.
+- `gpulock` also includes stale-lock cleanup logic, so agents should not reimplement their own ad hoc lock cleanup unless they are debugging `gpulock` itself.

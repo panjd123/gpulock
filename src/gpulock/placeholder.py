@@ -161,7 +161,7 @@ def _capture_placeholder_graph(torch, load_a, load_b, load_c, iters: int):
 
 
 def build_placeholder_graph(torch, load_a, load_b, load_c):
-    target_replay_s = 0.045
+    target_replay_s = 0.049
     calibration_iters = 128
     tolerance = 0.12
     calibration_stream = torch.cuda.Stream()
@@ -229,7 +229,7 @@ def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
         print(f"[gpulock] placeholder gpu{gpu_id}: {e}", file=sys.stderr)
         return 1
 
-    idle_sleep_s = 0.005
+    idle_sleep_s = 0.001
     state: dict[str, object] = {
         "buf": None,
         "graph": None,

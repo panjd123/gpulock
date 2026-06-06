@@ -10,7 +10,14 @@ import sys
 from typing import Any, Callable
 
 from . import supervisor as supervisor_backend
-from .common import GuardServiceConfig, say, warn
+from .common import (
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_PLACEHOLDER_IDLE_S,
+    DEFAULT_PLACEHOLDER_LOAD,
+    GuardServiceConfig,
+    say,
+    warn,
+)
 
 
 # --- value parsers --------------------------------------------------------
@@ -53,9 +60,9 @@ def _parse_env_kv(items: list[str]) -> dict[str, str]:
 # mapped to (parser, default-factory).
 _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "gpu_ids": (_parse_gpu_ids, list),
-    "idle_timeout": (int, lambda: 5400),
-    "placeholder_idle_s": (float, lambda: 0.0),
-    "placeholder_load": (_parse_bool, lambda: True),
+    "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
+    "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
+    "placeholder_load": (_parse_bool, lambda: DEFAULT_PLACEHOLDER_LOAD),
 }
 
 
@@ -103,10 +110,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--gpu-ids", default=None,
         help="comma/space separated GPU IDs to watch (default: all visible GPUs)",
     )
-    p_install.add_argument("--idle-timeout", type=int, default=5400)
-    p_install.add_argument("--placeholder-idle-s", type=float, default=0.0)
+    p_install.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT)
+    p_install.add_argument("--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S)
     g = p_install.add_mutually_exclusive_group()
-    g.add_argument("--placeholder-load", dest="placeholder_load", action="store_true", default=True)
+    g.add_argument("--placeholder-load", dest="placeholder_load", action="store_true", default=DEFAULT_PLACEHOLDER_LOAD)
     g.add_argument("--no-placeholder-load", dest="placeholder_load", action="store_false")
     p_install.add_argument(
         "--env", action="append", default=[], metavar="KEY=VALUE",
