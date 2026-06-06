@@ -1,6 +1,6 @@
 # gpulock
 
-多租户 GPU 的读写锁命令行：用 `gpulock` 包住命令，自动取/还锁、心跳、清理 stale lock；可选 guard service 在空闲时占住显存，任务到来时让出。
+多租户 GPU 的读写锁命令行：用 `gpulock` 包住命令，自动取/还锁、心跳、清理 stale lock；可选 guard service 在空闲时启动 placeholder，占用显存并维持计算负载，任务到来时让出。
 
 ## Install
 
@@ -84,7 +84,7 @@ gpulock read 0 -- 'python test.py > out.log'
 
 ```bash
 gpulock service install [--gpu-ids 0,1] [--idle-timeout 5400] \
-                        [--placeholder-idle-s 1.0] [--no-placeholder-load] \
+                        [--placeholder-idle-s 1.0] \
                         [--no-start] [--env K=V ...]
 gpulock service start | stop | restart | status | uninstall
 gpulock service logs [-n N] [-f]
@@ -94,7 +94,7 @@ gpulock service config set <key=value> [...]
 gpulock service config unset <key>
 ```
 
-Guard 由 supervisord 托管。空闲时启动 placeholder 占显存/可选保持 util，检测到 gpulock 自有锁或 activity pulse 后立即 park。长时间无活动后 dormant，释放显存；新活动到达后复活。
+Guard 由 supervisord 托管。空闲时启动 placeholder 占用显存并维持计算负载，检测到 gpulock 自有锁或 activity pulse 后立即 park。长时间无活动后 dormant，释放显存和计算负载；新活动到达后复活。
 
 Service 文件在 `${lock_root}/service/`：
 
@@ -107,7 +107,7 @@ supervisor.sock
 guard.log
 ```
 
-可通过 `config set/edit` 调整：`gpu_ids`、`idle_timeout`、`placeholder_idle_s`、`placeholder_load`。改完执行 `gpulock service restart` 生效。
+可通过 `config set/edit` 调整：`gpu_ids`、`idle_timeout`、`placeholder_idle_s`。改完执行 `gpulock service restart` 生效。
 
 Service config:
 
@@ -116,7 +116,6 @@ Service config:
 | `gpu_ids` | empty | guard 监控的 GPU ID；空值表示启动时枚举全部可见 GPU |
 | `idle_timeout` | 5400 | 无 gpulock 活动超过多少秒后进入 dormant，并释放 active placeholder |
 | `placeholder_idle_s` | 1.0 | GPU 无自有锁/活动后，等待多少秒再 activate placeholder；默认值明显高于连续 `gpulock read ...` 启动间隔，避免连续脚本中间插入 placeholder |
-| `placeholder_load` | true | placeholder 是否维持一段轻量 compute load；true 时约 49ms compute + 1ms sleep，false 时只预留显存 |
 
 `extra_env`、`python_executable`、`gpulock_executable` 保存在 `config.json` 里，通常由 `service install` 写入；需要改 `extra_env` 时用 `gpulock service config edit`。
 

@@ -201,7 +201,7 @@ def build_placeholder_graph(torch, load_a, load_b, load_c):
 # Placeholder process entry point
 # ---------------------------------------------------------------------------
 
-def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
+def placeholder_main(gpu_id: int) -> int:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     import setproctitle  # type: ignore
@@ -272,7 +272,7 @@ def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
                 f"[gpulock] placeholder gpu{gpu_id}: allocated {count * 4 / 1e9:.1f}GB",
                 flush=True,
             )
-        if not keep_util or state["graph"] is not None:
+        if state["graph"] is not None:
             return
         load_dim = 2048
         load_a = torch.randn((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
@@ -297,10 +297,8 @@ def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
         )
 
     def state_label() -> str:
-        if enabled and keep_util:
-            return "active"
         if enabled:
-            return "reserved"
+            return "active"
         return "parked"
 
     def handle_command(raw_command: str) -> str:
@@ -319,7 +317,7 @@ def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
             return "ok state=stopping"
         if command == "status":
             return (
-                f"ok state={state_label()} keep_util={int(keep_util)} "
+                f"ok state={state_label()} "
                 f"iters={int(state['load_iters'])} replay_s={float(state['replay_s']):.6f}"
             )
         return f"error unknown_command={command}"
@@ -381,7 +379,7 @@ def placeholder_main(gpu_id: int, keep_util: bool = True) -> int:
                 break
             if handled:
                 continue
-            if enabled and keep_util:
+            if enabled:
                 replay_stream = state["replay_stream"]
                 graph = state["graph"]
                 if replay_stream is None or graph is None:

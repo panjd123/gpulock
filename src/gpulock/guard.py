@@ -26,7 +26,7 @@ from .placeholder import (
     stop_placeholder,
     wait_placeholder_ready,
 )
-from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S, DEFAULT_PLACEHOLDER_LOAD
+from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
 
 
 def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
@@ -116,14 +116,6 @@ def cmd_guard(argv: list[str]) -> int:
         "--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S,
         help=f"seconds of GPU idleness before spawning placeholder (default {DEFAULT_PLACEHOLDER_IDLE_S})",
     )
-    parser.add_argument(
-        "--placeholder-load", dest="placeholder_load", action="store_true", default=DEFAULT_PLACEHOLDER_LOAD,
-        help="keep a compute loop in placeholder so GPU util stays non-zero (default: enabled)",
-    )
-    parser.add_argument(
-        "--no-placeholder-load", dest="placeholder_load", action="store_false",
-        help="disable placeholder compute loop and only reserve memory",
-    )
     args = parser.parse_args(argv)
     args.gpu_ids = _resolve_guard_gpu_ids(args.gpu_ids)
     if not args.gpu_ids:
@@ -185,7 +177,7 @@ def cmd_guard(argv: list[str]) -> int:
         proc = subprocess.Popen(
             [
                 sys.executable, "-m", "gpulock", "_placeholder",
-                str(gid), "1" if args.placeholder_load else "0",
+                str(gid),
             ],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
@@ -273,9 +265,8 @@ def cmd_guard(argv: list[str]) -> int:
     conn.commit()
 
     log.info(
-        "watching gpu %s (placeholder_load=%s, placeholder_idle_s=%.3f)",
+        "watching gpu %s (placeholder_idle_s=%.3f)",
         args.gpu_ids,
-        "on" if args.placeholder_load else "off",
         max(args.placeholder_idle_s, 0.0),
     )
     for gid in args.gpu_ids:
@@ -330,7 +321,7 @@ def cmd_guard(argv: list[str]) -> int:
                         log.info("gpu%d: placeholder running stably, cleared startup-failure suppression", gid)
                 if ph_alive:
                     state = placeholder_state(gpu_dir, timeout_s=0.5)
-                    if state in ("active", "reserved"):
+                    if state == "active":
                         placeholder_active.add(gid)
                     elif state == "parked":
                         placeholder_active.discard(gid)

@@ -14,7 +14,6 @@ from ..paths import resolve_lock_root
 _PREFIX = "[gpulock service]"
 DEFAULT_IDLE_TIMEOUT = 5400
 DEFAULT_PLACEHOLDER_IDLE_S = 1.0
-DEFAULT_PLACEHOLDER_LOAD = True
 
 
 def say(msg: str) -> None:
@@ -55,7 +54,6 @@ class GuardServiceConfig:
     gpu_ids: list[int] = field(default_factory=list)
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT
     placeholder_idle_s: float = DEFAULT_PLACEHOLDER_IDLE_S
-    placeholder_load: bool = DEFAULT_PLACEHOLDER_LOAD
     extra_env: dict[str, str] = field(default_factory=dict)
     python_executable: str = ""
     gpulock_executable: str = ""
@@ -66,7 +64,6 @@ class GuardServiceConfig:
             *(str(g) for g in self.gpu_ids),
             "--idle-timeout", str(self.idle_timeout),
             "--placeholder-idle-s", str(self.placeholder_idle_s),
-            "--placeholder-load" if self.placeholder_load else "--no-placeholder-load",
         ]
 
     def save(self, lock_root: Path | None = None) -> Path:
@@ -88,7 +85,6 @@ class GuardServiceConfig:
             gpu_ids=[int(x) for x in data.get("gpu_ids", [])],
             idle_timeout=int(data.get("idle_timeout", DEFAULT_IDLE_TIMEOUT)),
             placeholder_idle_s=float(data.get("placeholder_idle_s", DEFAULT_PLACEHOLDER_IDLE_S)),
-            placeholder_load=bool(data.get("placeholder_load", DEFAULT_PLACEHOLDER_LOAD)),
             extra_env={str(k): str(v) for k, v in dict(data.get("extra_env", {})).items()},
             python_executable=str(data.get("python_executable", "")),
             gpulock_executable=str(data.get("gpulock_executable", "")),

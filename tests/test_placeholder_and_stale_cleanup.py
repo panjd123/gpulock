@@ -200,8 +200,8 @@ def test_placeholder_client_helpers_parse_status_and_missing_socket(lock_root, m
 
     assert placeholder.placeholder_command(gpu_dir, "status") == (False, "missing socket")
 
-    monkeypatch.setattr(placeholder, "placeholder_command", lambda *_args, **_kwargs: (True, "ok state=reserved"))
-    assert placeholder.placeholder_state(gpu_dir) == "reserved"
+    monkeypatch.setattr(placeholder, "placeholder_command", lambda *_args, **_kwargs: (True, "ok state=active"))
+    assert placeholder.placeholder_state(gpu_dir) == "active"
 
 
 def test_gpu_has_our_activity_ignores_dead_locks_and_placeholder_pid(lock_root, monkeypatch):
@@ -249,6 +249,32 @@ def _write_fake_placeholder_deps(module_dir: Path) -> None:
         encoding="utf-8",
     )
     (module_dir / "torch.py").write_text(
+        "class _Context:\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *_args):\n"
+        "        return False\n"
+        "\n"
+        "class _Event:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        pass\n"
+        "    def record(self, *_args, **_kwargs):\n"
+        "        return None\n"
+        "    def synchronize(self):\n"
+        "        return None\n"
+        "    def elapsed_time(self, _other):\n"
+        "        return 1.0\n"
+        "\n"
+        "class _Stream:\n"
+        "    def wait_stream(self, _stream):\n"
+        "        return None\n"
+        "    def synchronize(self):\n"
+        "        return None\n"
+        "\n"
+        "class _Graph:\n"
+        "    def replay(self):\n"
+        "        return None\n"
+        "\n"
         "class _Props:\n"
         "    total_memory = 64 * 1024 * 1024\n"
         "\n"
@@ -263,11 +289,30 @@ def _write_fake_placeholder_deps(module_dir: Path) -> None:
         "        return None\n"
         "    def empty_cache(self):\n"
         "        return None\n"
+        "    def Event(self, *args, **kwargs):\n"
+        "        return _Event(*args, **kwargs)\n"
+        "    def Stream(self):\n"
+        "        return _Stream()\n"
+        "    def current_stream(self):\n"
+        "        return _Stream()\n"
+        "    def stream(self, _stream):\n"
+        "        return _Context()\n"
+        "    def CUDAGraph(self):\n"
+        "        return _Graph()\n"
+        "    def graph(self, *_args, **_kwargs):\n"
+        "        return _Context()\n"
         "\n"
         "cuda = _Cuda()\n"
         "float32 = object()\n"
+        "float16 = object()\n"
         "\n"
         "def empty(*_args, **_kwargs):\n"
+        "    return object()\n"
+        "\n"
+        "def randn(*_args, **_kwargs):\n"
+        "    return object()\n"
+        "\n"
+        "def mm(*_args, **_kwargs):\n"
         "    return object()\n",
         encoding="utf-8",
     )
@@ -349,7 +394,6 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
             "99",
             "--placeholder-idle-s",
             "0.05",
-            "--no-placeholder-load",
             "--idle-timeout",
             "30",
         ],
@@ -362,7 +406,7 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
     try:
         initial_state = _wait_until(
             time.monotonic() + 10.0,
-            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "reserved",
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
         )
         if guard_proc.poll() is not None:
             stdout, stderr = guard_proc.communicate(timeout=1)
@@ -399,7 +443,7 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
 
         reactivated_state = _wait_until(
             time.monotonic() + 6.0,
-            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "reserved",
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
         )
         assert reactivated_state is True
     finally:
@@ -423,7 +467,6 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
             "99",
             "--placeholder-idle-s",
             str(DEFAULT_PLACEHOLDER_IDLE_S),
-            "--no-placeholder-load",
             "--idle-timeout",
             "30",
         ],
@@ -436,7 +479,7 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
     try:
         initial_state = _wait_until(
             time.monotonic() + 10.0,
-            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "reserved",
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
         )
         assert initial_state is True
 
@@ -446,7 +489,7 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
 
         reactivated_state = _wait_until(
             time.monotonic() + 3.0,
-            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "reserved",
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
         )
         assert reactivated_state is True
     finally:

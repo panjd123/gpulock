@@ -200,10 +200,7 @@ def main() -> int:
     if len(sys.argv) > 1:
         sub = sys.argv[1]
         if sub == "_placeholder":
-            keep_util = True
-            if len(sys.argv) > 3:
-                keep_util = sys.argv[3].strip().lower() not in ("0", "false", "no", "off")
-            return placeholder_main(int(sys.argv[2]), keep_util=keep_util)
+            return placeholder_main(int(sys.argv[2]))
         if sub == "guard":
             return cmd_guard(sys.argv[2:])
         if sub == "service":

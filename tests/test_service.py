@@ -15,7 +15,6 @@ def test_guard_service_config_round_trip(lock_root):
         gpu_ids=[0, 2, 5],
         idle_timeout=900,
         placeholder_idle_s=1.5,
-        placeholder_load=False,
         extra_env={"FOO": "bar", "K": "v=eq"},
         python_executable="/usr/bin/python3",
         gpulock_executable="/opt/gpulock/bin/gpulock",
@@ -34,7 +33,6 @@ def test_guard_service_config_round_trip(lock_root):
         "900",
         "--placeholder-idle-s",
         "1.5",
-        "--no-placeholder-load",
     ]
 
 
@@ -43,7 +41,6 @@ def test_supervisord_conf_rendering(lock_root):
         gpu_ids=[0, 2, 5],
         idle_timeout=900,
         placeholder_idle_s=1.5,
-        placeholder_load=False,
         extra_env={"FOO": "bar", "K": "v=eq"},
         python_executable="/usr/bin/python3",
         gpulock_executable="/opt/gpulock/bin/gpulock",
@@ -78,7 +75,6 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
         "0,1",
         "--idle-timeout",
         "600",
-        "--no-placeholder-load",
         "--env",
         "FOO=bar",
     ])
@@ -91,14 +87,13 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert saved_cfg["gpu_ids"] == [0, 1]
     assert saved_cfg["idle_timeout"] == 600
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
-    assert saved_cfg["placeholder_load"] is False
+    assert "placeholder_load" not in saved_cfg
     assert saved_cfg["extra_env"]["FOO"] == "bar"
 
     conf_on_disk = (service_dir / "supervisord.conf").read_text()
     for needle in (
         "[program:gpulock-guard]",
         "--idle-timeout 600",
-        "--no-placeholder-load",
         'environment=FOO="bar"',
     ):
         assert needle in conf_on_disk
@@ -117,7 +112,6 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert "gpu_ids=0,1" in proc.stdout
     assert "idle_timeout=600" in proc.stdout
     assert f"placeholder_idle_s={DEFAULT_PLACEHOLDER_IDLE_S}" in proc.stdout
-    assert "placeholder_load=false" in proc.stdout
 
     proc = run_cli(["service", "config", "get", "idle_timeout"])
     assert proc.returncode == 0
@@ -132,14 +126,12 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
         "set",
         "gpu_ids=2,3,4",
         "idle_timeout=1234",
-        "placeholder_load=true",
     ])
     assert proc.returncode == 0, proc.stderr
     assert "service restart" in proc.stdout
     saved_cfg2 = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg2["gpu_ids"] == [2, 3, 4]
     assert saved_cfg2["idle_timeout"] == 1234
-    assert saved_cfg2["placeholder_load"] is True
 
     proc = run_cli(["service", "config", "set", "idle_timeout=not-a-number"])
     assert proc.returncode != 0
@@ -176,7 +168,6 @@ def test_supervisord_daemon_lifecycle(run_cli, lock_root):
         "0",
         "--idle-timeout",
         "10",
-        "--no-placeholder-load",
     ])
     assert proc.returncode == 0, proc.stderr
 

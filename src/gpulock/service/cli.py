@@ -13,7 +13,6 @@ from . import supervisor as supervisor_backend
 from .common import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PLACEHOLDER_IDLE_S,
-    DEFAULT_PLACEHOLDER_LOAD,
     GuardServiceConfig,
     say,
     warn,
@@ -62,7 +61,6 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "gpu_ids": (_parse_gpu_ids, list),
     "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
-    "placeholder_load": (_parse_bool, lambda: DEFAULT_PLACEHOLDER_LOAD),
 }
 
 
@@ -112,9 +110,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_install.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT)
     p_install.add_argument("--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S)
-    g = p_install.add_mutually_exclusive_group()
-    g.add_argument("--placeholder-load", dest="placeholder_load", action="store_true", default=DEFAULT_PLACEHOLDER_LOAD)
-    g.add_argument("--no-placeholder-load", dest="placeholder_load", action="store_false")
     p_install.add_argument(
         "--env", action="append", default=[], metavar="KEY=VALUE",
         help="extra environment variable to inject into the guard (repeat to add more)",
@@ -161,7 +156,6 @@ def _do_install(args: argparse.Namespace) -> int:
             gpu_ids=_parse_gpu_ids(args.gpu_ids),
             idle_timeout=int(args.idle_timeout),
             placeholder_idle_s=float(args.placeholder_idle_s),
-            placeholder_load=bool(args.placeholder_load),
             extra_env=_parse_env_kv(list(args.env)),
             python_executable=sys.executable or "",
             gpulock_executable=shutil.which("gpulock") or "",
