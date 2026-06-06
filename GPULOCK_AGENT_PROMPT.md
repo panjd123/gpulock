@@ -1,70 +1,62 @@
-# gpulock Prompt For Coding Agents
+# GPU Execution Policy For Agents
 
-This file is a reusable prompt snippet for other projects that use `gpulock`.
+These instructions are for AI agents working in an environment where GPU access is coordinated by `gpulock`.
 
-It is not the `AGENTS.md` for the `gpulock` repository itself. Instead, copy or adapt it into another project's agent instructions when that project should run GPU work through `gpulock`.
+## Core Rule
 
-## Suggested instructions
+Every command that may use a GPU must be run through `gpulock`.
 
-Use `gpulock` for all GPU commands in this workspace.
+Do this even for quick tests, smoke checks, benchmarks, profiling, model loading, CUDA probes, and scripts that may indirectly import GPU frameworks such as PyTorch, TensorFlow, JAX, Triton, CUDA, or TensorRT.
 
-- correctness / validation / functional tests: `gpulock check <gpu_ids> -- <command>`
-- performance / profiling / exclusive GPU work: `gpulock perf <gpu_ids> -- <command>`
+Use one of these forms:
 
-`<gpu_ids>` can be a single integer (e.g. `0`) or comma-separated list (e.g. `0,1,2`) for multi-GPU workloads.
+```bash
+gpulock check <gpu_ids> -- <command>
+gpulock perf <gpu_ids> -- <command>
+```
 
-Do not run raw GPU commands directly unless the user explicitly asks to bypass `gpulock`.
+Use `gpulock check` when the command needs a GPU but its performance does not matter. This is the right default for correctness, validation, smoke tests, unit/integration tests, and exploratory runs. It may share the GPU with other `check` users and can affect the performance of other GPU programs.
 
-## Locking model
+Use `gpulock perf` when measuring performance or when the command needs a clean, isolated GPU environment. This is the right mode for benchmarks, profiling, timing-sensitive work, and performance comparisons.
 
-`gpulock` is not just a wrapper. It provides a GPU coordination mechanism with lock semantics:
+Conceptually, `check` and `perf` behave like read/write locks: multiple `check` runs may coexist, while `perf` is exclusive and blocks both `check` and other `perf` runs.
 
-- `gpulock check` uses a read lock.
-- `gpulock perf` uses a write lock.
-- read locks can run concurrently with other read locks.
-- write locks are exclusive and block both read and write lock holders.
+`<gpu_ids>` may be a single GPU such as `0`, or a comma-separated list such as `0,1,2`.
 
-This means correctness-style jobs can share a GPU when that is allowed, while performance or profiling jobs can request exclusive access when isolation matters.
+## Environment Boundary
 
-## Queueing and fairness
+This is an environment-specific execution policy, not a project requirement.
 
-`gpulock` has a queueing mechanism instead of naive busy racing.
+Wrap commands externally when running them here. Do not add `gpulock` to project scripts, source code, tests, CI configs, Makefiles, docs, README examples, or committed command snippets unless the user explicitly asks for that.
 
-- lock requests are queued in arrival order.
-- writers are protected from starvation.
-- an agent should wait through `gpulock` rather than bypass it with a raw GPU command.
+Project code should remain runnable outside this environment.
 
-If the GPU is busy or another task already holds the lock, the correct behavior is usually to keep using `gpulock`, not to work around it.
+## Examples
 
-## Placeholder behavior
+```bash
+gpulock check 0 -- python -m pytest tests/test_cuda.py
+gpulock check 0 -- python scripts/smoke.py
+gpulock perf 0 -- python benchmarks/run.py
+gpulock perf 0,1 -- python train.py --config config.yaml
+```
 
-This environment may have a background `gpulock` placeholder process that reserves GPU memory while the machine is idle.
+If a command might touch GPU state, wrap it. When unsure, use `gpulock check`.
 
-The placeholder process name is:
+## Placeholder Process
 
-- `tensorrt_engine_cache`
+The environment may show a `gpulock` placeholder process in `nvidia-smi`, often named:
 
-This placeholder is part of normal `gpulock` behavior. It is used to keep idle GPUs reserved and reduce preemption / interference in shared environments.
+```text
+tensorrt_engine_cache
+```
 
-When a `gpulock` command starts, the guard automatically parks the placeholder and releases its memory before the wrapped workload runs. In normal use, the placeholder should not be treated as an external GPU conflict.
+This is normal. It is managed by `gpulock` and should not be treated as an external conflict.
 
-Do not avoid `gpulock` just because `nvidia-smi` shows placeholder memory usage. Do not manually kill the placeholder unless the task is specifically about debugging the `gpulock` service itself.
+Do not manually kill the placeholder unless the user is specifically asking to debug the `gpulock` service.
 
-## How agents should interpret GPU state
+## Practical Notes
 
-If `nvidia-smi` shows GPU memory usage or a process named `tensorrt_engine_cache`, do not assume the GPU is unusable.
-
-- if you are supposed to run through `gpulock`, just run through `gpulock`
-- `gpulock` will automatically coordinate with its own placeholder
-- seeing the placeholder is not, by itself, a reason to bypass locking
-
-For performance-sensitive work, prefer trusting `gpulock perf` to obtain the exclusive write lock instead of manually trying to clear the GPU.
-
-## Practical reminders
-
-- `gpulock` injects `CUDA_VISIBLE_DEVICES=<gpu_ids>` into the wrapped command by default, as an outer-environment fallback. For multi-GPU jobs this will be a comma-separated list (e.g. `0,1,2`).
-- Do not remove explicit `CUDA_VISIBLE_DEVICES` handling from project scripts just because `gpulock` injects it. Those scripts may also run in environments without `gpulock`, where their own GPU selection is still needed for correctness.
-- If a task is read-only or correctness-oriented, prefer `gpulock check`.
-- If a task is performance-sensitive or requires exclusive access, prefer `gpulock perf`.
-- If a task must wait for coordinated access, let `gpulock` handle the waiting and queueing.
-- `gpulock` also includes stale-lock cleanup logic, so agents should not reimplement their own ad hoc lock cleanup unless they are debugging `gpulock` itself.
+- `gpulock` sets `CUDA_VISIBLE_DEVICES=<gpu_ids>` for the wrapped command.
+- Keep project-level GPU selection logic intact; `gpulock` is only the outer execution wrapper for this environment.
+- If a GPU is busy, wait through `gpulock` instead of bypassing it.
+- For performance-sensitive runs, use `gpulock perf` instead of trying to manually clear the GPU.
