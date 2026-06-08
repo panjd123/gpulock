@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求)
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态)
 
-`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个 coding agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
+`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个 coding agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目随包附带一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md)）；运行 `gpulock agent` 即可打印它，并附带把它写入 agent `AGENTS.md` 的说明，agent 据此即可正确地使用本工具。
 
 `gpulock` 的核心，是在命令运行期间为其包上一把读写锁。正确性类工作在读锁下共享 GPU（`check` / `read`），对性能敏感的工作则在写锁下独占 GPU（`perf` / `write`）。请求按**先到先服务**处理，因此源源不断的读者不会饿死正在等待的写者。这套加锁与排队是完全自包含的：它就是 `gpulock <mode> -- <cmd>` 的全部工作，无需任何后台服务即可运行。
 
@@ -311,7 +311,44 @@ GPULOCK_LOCK_DIR  →  /var/lock/gpulock  →  /tmp/gpulock_locks
 
 ## 配合 AI Agent 使用
 
-当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md) 的内容加入目标项目的 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
+当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) 的内容加入 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
+
+该 prompt 已打包进项目内部，因此你无需自己去找这个文件，直接运行 `gpulock agent` 即可打印：
+
+```bash
+gpulock agent            # 打印 prompt，并附带写入 ./AGENTS.md 的说明（默认）
+gpulock agent --local    # 同上：目标为当前目录的 AGENTS.md
+gpulock agent --global   # 目标为当前 coding agent 工具的全局 AGENTS.md
+```
+
+`gpulock agent` 会先打印一段简短的前言，再打印用 `<!-- gpulock:start -->` / `<!-- gpulock:end -->` 标记包裹的 prompt 正文。前言会告诉 agent 应写入哪个 `AGENTS.md`（`--local` 为当前目录，`--global` 为该工具的全局文件，例如 `~/.codex/AGENTS.md` 或 `~/.trae/AGENTS.md`），以及如何就地创建或更新该文件而不重复写入。
+
+### 一条命令完成安装
+
+它的输出本就是为了直接喂给 coding agent CLI，由后者替你完成写入。按你所用的工具选择对应命令：
+
+```bash
+# Codex CLI —— 非交互模式；审批/沙箱取自 ~/.codex/config.toml
+codex exec --skip-git-repo-check "$(gpulock agent)"           # ./AGENTS.md（当前项目）
+codex exec --skip-git-repo-check "$(gpulock agent --global)"  # ~/.codex/AGENTS.md（所有项目）
+
+# Coco / Trae CLI —— -y 自动批准文件写入
+coco -y -p "$(gpulock agent --global)"                        # ~/.trae/AGENTS.md（所有项目）
+
+# Cursor CLI —— 命令名为 `agent`；-f 允许写入（无机器级全局文件）
+agent -p -f "$(gpulock agent --local)"                        # ./AGENTS.md（当前项目）
+
+# Claude Code —— --dangerously-skip-permissions 允许写入
+claude -p --dangerously-skip-permissions "$(gpulock agent --global)" </dev/null  # ~/.claude/CLAUDE.md
+```
+
+用 `--global` 在每台机器上配置一次即可覆盖所有项目；用 `--local`（默认）则只作用于当前 checkout。该命令是幂等的：重复运行只会更新已有的 `gpulock` 区块，而不会追加重复内容。
+
+各工具注意事项：
+
+- **Codex：** `codex exec` 为非交互模式；`codex` 的 `-p` 表示 `--profile`，并非 print。`--skip-git-repo-check` 允许在非受信 git 仓库外运行；若 stdin 被管道占用，请追加 `</dev/null`。若想自己审阅改动，可改用交互形式：`codex "$(gpulock agent)"`。
+- **Cursor：** 其命令名为 `agent`。它没有机器级全局指令文件，因此请用 `--local` 按项目安装，或在 Cursor 设置里添加为 User Rule。
+- `-y` / `-f` / `--dangerously-skip-permissions` 用于让 agent 无需交互审批即可应用改动；若你希望逐步确认，可去掉它们。
 
 ## 项目结构
 

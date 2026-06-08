@@ -12,9 +12,10 @@
 `gpulock` is built for hosts that run many GPU tasks at once — for example, several
 jobs, or multiple coding agents, sharing the same cards. Because every GPU access is
 serialized through a read/write lock, concurrent tasks take turns on a GPU instead of
-interfering with one another. A ready-to-use prompt is provided in
-[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md); adding it to an agent's
-instructions is enough for the agent to use the tool correctly.
+interfering with one another. A ready-to-use prompt ships with the package
+([`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md)); run
+`gpulock agent` to print it together with instructions for installing it into an
+agent's `AGENTS.md`, and the agent will use the tool correctly.
 
 At its core, `gpulock` wraps a command in a read/write lock for the lifetime of that
 command. Correctness work shares a GPU under a read lock (`check` / `read`), while
@@ -405,10 +406,63 @@ CLI flags override the corresponding environment variables; see `gpulock --help`
 ## Using gpulock with AI agents
 
 When coding agents run on a shared GPU host, add the contents of
-[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md) to the target project's agent
+[`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) to the agent's
 guidelines. The prompt instructs agents to wrap every GPU-touching command in
 `gpulock` and explains when to choose `check` versus `perf`, without embedding
 `gpulock` in the project's own scripts.
+
+The policy ships inside the package, so you do not need to track the file down.
+Run `gpulock agent` to print it:
+
+```bash
+gpulock agent            # print the policy + how to add it to ./AGENTS.md (default)
+gpulock agent --local    # same as above: target the current directory's AGENTS.md
+gpulock agent --global   # target the coding-agent tool's global AGENTS.md
+```
+
+`gpulock agent` prints a short preamble followed by the policy wrapped in
+`<!-- gpulock:start -->` / `<!-- gpulock:end -->` markers. The preamble tells the
+agent which `AGENTS.md` to write to (the current directory for `--local`, or the
+tool's global file such as `~/.codex/AGENTS.md` or `~/.trae/AGENTS.md` for
+`--global`) and how to create or update that file in place without duplicating the
+block.
+
+### Install it with one command
+
+The output is meant to be fed straight to a coding-agent CLI, which then performs
+the edit for you. Pick the line that matches your tool:
+
+```bash
+# Codex CLI — non-interactive; approvals/sandbox come from ~/.codex/config.toml
+codex exec --skip-git-repo-check "$(gpulock agent)"           # ./AGENTS.md (this project)
+codex exec --skip-git-repo-check "$(gpulock agent --global)"  # ~/.codex/AGENTS.md (all projects)
+
+# Coco / Trae CLI — -y auto-approves the file edit
+coco -y -p "$(gpulock agent --global)"                        # ~/.trae/AGENTS.md (all projects)
+
+# Cursor CLI — command is `agent`; -f allows the write (no machine-global file)
+agent -p -f "$(gpulock agent --local)"                        # ./AGENTS.md (this project)
+
+# Claude Code — --dangerously-skip-permissions allows the write
+claude -p --dangerously-skip-permissions "$(gpulock agent --global)" </dev/null  # ~/.claude/CLAUDE.md
+```
+
+Use `--global` once per machine to cover every project, or `--local` (the default)
+to scope the policy to the current checkout. The command is idempotent: re-running
+it updates the existing `gpulock` block instead of appending a duplicate.
+
+Per-tool notes:
+
+- **Codex:** `codex exec` runs non-interactively; `-p` on `codex` means `--profile`,
+  not print. `--skip-git-repo-check` lets it run outside a trusted git repo, and add
+  `</dev/null` if stdin is piped. To review the edit yourself, use the interactive
+  form instead: `codex "$(gpulock agent)"`.
+- **Cursor:** the binary is invoked as `agent`. It has no machine-global instruction
+  file, so use `--local` per project, or add the policy as a User Rule in Cursor
+  settings.
+- The `-y` / `-f` / `--dangerously-skip-permissions` flags let the agent apply the
+  edit without an interactive approval prompt; drop them if you prefer to confirm
+  each step.
 
 ## Project layout
 

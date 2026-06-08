@@ -10,6 +10,7 @@ import sys
 
 from .config import LockConfig, READ_MODE, WRITE_MODE
 from .config import env_int as _env_int
+from .agent import cmd_agent
 from .guard import cmd_guard
 from .logging_setup import setup_main_logger
 from .paths import resolve_lock_root
@@ -209,6 +210,8 @@ def main() -> int:
             return cmd_guard(sys.argv[2:])
         if sub == "service":
             return cmd_service(sys.argv[2:])
+        if sub == "agent":
+            return cmd_agent(sys.argv[2:])
 
     args = _parse_run_args(sys.argv[1:])
     return _run_locked_command(args)
