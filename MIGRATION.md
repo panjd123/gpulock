@@ -1,6 +1,7 @@
 # gpulock Migration Notes
 
-This refactor removes the old benchmark-oriented naming from the runtime surface.
+This release removes the legacy benchmark-oriented naming from the runtime surface.
+The tables below map every renamed or removed identifier to its replacement.
 
 ## Environment Variables
 
