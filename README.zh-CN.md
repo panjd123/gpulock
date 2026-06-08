@@ -9,7 +9,9 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求)
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态)
 
-`gpulock` 对你运行的命令做一层包装，并提供两项互补的能力：
+`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个编码 agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
+
+它对你运行的命令做一层包装，并提供两项互补的能力：
 
 1. **加锁与排队。** 它为命令所使用的每一张 NVIDIA GPU 施加读写锁，并辅以**先到先服务**的排队机制。并发命令会有序地协调对 GPU 的访问，而非悄无声息地相互干扰。正确性类负载在读锁下共享 GPU（`check` / `read`）；对性能敏感的负载在写锁下独占 GPU（`perf` / `write`）。
 2. **空闲预留。** 当 GPU 本应空闲时，后台守护进程通过占用显存并维持利用率来预留它，避免该设备在任务之间被回收、被调度走或被降频。
@@ -39,8 +41,6 @@ gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能�
 这体现了共享主机上的一种常见策略。守护进程预留除 GPU 0 之外的所有 GPU，把 GPU 0 留给不经包装的临时命令、或尚未接入 `gpulock` 的 agent；请确认预留 `(n-1)/n` 张 GPU 仍满足你的利用率目标。`idle_timeout` 指**在没有任何 `gpulock` 活动**多少秒之后，守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用；此处设为约十年，**默认值为 `5400`（90 分钟）**。只有 `gpulock` 活动会重置该计时器——绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
 
 包装本身是透明的：`gpulock` 取锁、维持心跳、原样运行命令，并在退出时还锁。无需改动应用代码、容器镜像或任务框架。
-
-`gpulock` 尤其适合运行大量并发任务的主机，例如多个编码 agent 共享同一组 GPU 的场景。由于每一次 GPU 访问都通过锁被串行化，并发的 agent 之间不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
 
 ---
 

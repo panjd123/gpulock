@@ -9,7 +9,14 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#project-status)
 
-`gpulock` wraps the command you run and provides two complementary capabilities:
+`gpulock` is built for hosts that run many GPU tasks at once — for example, several
+jobs, or multiple coding agents, sharing the same cards. Because every GPU access is
+serialized through a read/write lock, concurrent tasks take turns on a GPU instead of
+interfering with one another. A ready-to-use prompt is provided in
+[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md); adding it to an agent's
+instructions is enough for the agent to use the tool correctly.
+
+It wraps the command you run and provides two complementary capabilities:
 
 1. **Locking and queuing.** It applies a read/write lock, backed by
    first-come-first-served queuing, to each NVIDIA GPU a command uses. Concurrent
@@ -58,12 +65,6 @@ is set to roughly ten years here and **defaults to `5400` (90 minutes)**. Only
 The wrapper itself is transparent: `gpulock` acquires the lock, maintains a heartbeat,
 runs the command unmodified, and releases the lock on exit. No changes to application
 code, container images, or job frameworks are required.
-
-`gpulock` is well suited to hosts that run many concurrent tasks, such as multiple
-coding agents sharing the same GPUs. Because every GPU access is serialized through
-the lock, concurrent agents do not interfere with one another. A ready-to-use prompt
-is provided in [`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md); adding it to an
-agent's instructions is sufficient for the agent to use the tool correctly.
 
 ---
 
