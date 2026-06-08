@@ -16,55 +16,27 @@ interfering with one another. A ready-to-use prompt is provided in
 [`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md); adding it to an agent's
 instructions is enough for the agent to use the tool correctly.
 
-It wraps the command you run and provides two complementary capabilities:
+At its core, `gpulock` wraps a command in a read/write lock for the lifetime of that
+command. Correctness work shares a GPU under a read lock (`check` / `read`), while
+performance-sensitive work takes it exclusively under a write lock (`perf` / `write`).
+Requests are served first-come-first-served, so a steady stream of readers never
+starves a waiting writer. This locking and queuing is entirely self-contained: it is
+all that `gpulock <mode> -- <cmd>` does, and it needs no background service to run.
 
-1. **Locking and queuing.** It applies a read/write lock, backed by
-   first-come-first-served queuing, to each NVIDIA GPU a command uses. Concurrent
-   commands coordinate access to a GPU instead of colliding silently. Correctness
-   workloads share a GPU under a read lock (`check` / `read`); performance-sensitive
-   workloads take it exclusively under a write lock (`perf` / `write`).
-2. **Idle reservation.** While a GPU would otherwise be idle, a background guard
-   reserves it by holding memory and sustaining utilization, preventing the device
-   from being reclaimed, descheduled, or power-capped between jobs.
+A separate, optional **guard service** solves a different problem. A GPU left idle
+between jobs is often reclaimed, descheduled, or power-capped by the surrounding
+cluster, so while a card would otherwise sit unused the guard keeps it busy with a
+lightweight placeholder that holds memory and sustains utilization.
 
-The two capabilities form a single, integrated system. The idle reservation — both
-its memory allocation and its compute load — is released automatically and
-temporarily as soon as a command acquires a lock through `gpulock`, and is restored
-once the GPU returns to idle. Reserving an idle GPU therefore never interferes with
-real workloads.
+> **Locking and the guard are independent.** The read/write lock and queue work with
+> or without the guard running. They cooperate in only one direction: when a `gpulock`
+> command takes a lock, the guard's placeholder on that GPU is paused automatically —
+> and only for the duration of the lock — so the command runs on a clean card, and the
+> placeholder resumes once the GPU is idle again.
 
-```bash
-# 1. Install gpulock
-uv tool install -e . --force --reinstall --refresh --torch-backend auto
-
-# 2. Reserve idle GPUs with the guard service.
-#    Guards every GPU except GPU 0, leaving GPU 0 free for quick, unwrapped work.
-n=$(nvidia-smi -L | wc -l)
-if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
-gpulock service install
-gpulock service config set gpu_ids="$gpu_list"
-gpulock service config set idle_timeout=315360000   # ~10 years; effectively never auto-release
-gpulock service config show
-gpulock service restart
-gpulock service status
-
-# 3. Run any GPU command through gpulock
-gpulock check 0 -- python tests/test_kernel.py      # shared read lock    (correctness)
-gpulock perf  0 -- python benchmarks/run.py         # exclusive write lock (performance)
-```
-
-This reflects a common policy on a shared host. The guard reserves every GPU except
-GPU 0, leaving GPU 0 free for quick commands or agents that have not been wired to
-use `gpulock`; confirm that reserving `(n-1)/n` GPUs still meets your utilization
-target. `idle_timeout` is the number of seconds **without any `gpulock` activity**
-after which the guard releases a GPU, so a forgotten host is not occupied forever; it
-is set to roughly ten years here and **defaults to `5400` (90 minutes)**. Only
-`gpulock` activity resets this timer — GPU work that bypasses `gpulock` does not (see
-[The guard service](#the-guard-service)).
-
-The wrapper itself is transparent: `gpulock` acquires the lock, maintains a heartbeat,
-runs the command unmodified, and releases the lock on exit. No changes to application
-code, container images, or job frameworks are required.
+The wrapper is transparent: `gpulock` acquires the lock, maintains a heartbeat, runs
+the command unmodified, and releases it on exit. No changes to application code,
+container images, or job frameworks are required.
 
 ---
 
@@ -177,18 +149,46 @@ process.
 
 ## Quick start
 
+Install `gpulock`, optionally bring up the guard service, then run GPU commands
+through it:
+
 ```bash
-# Run a correctness test on GPU 1 under a shared read lock
-gpulock check 1 -- python tests/operator_correctness.py
+# 1. Install
+uv tool install -e . --force --reinstall --refresh --torch-backend auto
 
-# Benchmark on GPU 1 with exclusive access under a write lock
-gpulock perf 1 -- ./build/operator_perf --case matmul_fp16 --size 4096
+# 2. (Optional) reserve idle GPUs with the guard service.
+#    This guards every GPU except GPU 0, leaving GPU 0 free for quick, unwrapped work.
+n=$(nvidia-smi -L | wc -l)
+if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
+gpulock service install
+gpulock service config set gpu_ids="$gpu_list"
+gpulock service config set idle_timeout=315360000   # ~10 years; effectively never auto-release
+gpulock service config show
+gpulock service restart
+gpulock service status
 
-# Train across two GPUs; both locks are acquired before the command runs
+# 3. Run any GPU command through gpulock
+gpulock check 0 -- python tests/test_kernel.py      # shared read lock    (correctness)
+gpulock perf  0 -- python benchmarks/run.py         # exclusive write lock (performance)
+```
+
+Step 2 is optional and configures the standalone guard service. The example reserves
+every GPU except GPU 0, leaving GPU 0 free for quick commands or agents not yet wired
+to use `gpulock`; check that reserving `(n-1)/n` GPUs still meets your utilization
+target. `idle_timeout` is the number of seconds *without any `gpulock` activity* after
+which the guard releases a GPU, so a forgotten host is not held forever — it defaults
+to `5400` (90 minutes) and is set to roughly ten years above. Only `gpulock` activity
+resets this timer; GPU work that bypasses `gpulock` does not (see
+[The guard service](#the-guard-service)).
+
+A few more patterns:
+
+```bash
+# Lock several GPUs at once; every lock is taken before the command runs
 gpulock write 0,1 -- python train_multi_gpu.py
 
 # perf waits for the GPU to be idle by default; skip that check when every job
-# already goes through gpulock (faster acquire)
+# already goes through gpulock (a faster acquire)
 gpulock perf 1 --no-wait-gpu-idle -- ./build/operator_perf
 ```
 
@@ -302,8 +302,10 @@ available within the quoted form.
 
 ## The guard service
 
-The guard reserves idle GPUs so that they are not reclaimed and yields immediately
-when real work begins. It is managed by `supervisord`.
+The guard is optional and independent of locking: `gpulock`'s read/write locks behave
+the same whether or not it is installed. When running, it reserves idle GPUs so they
+are not reclaimed and yields immediately when real work begins. It is managed by
+`supervisord`.
 
 ```bash
 gpulock service install [--gpu-ids 0,1] [--idle-timeout 5400] \

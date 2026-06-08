@@ -11,34 +11,11 @@
 
 `gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个 coding agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
 
-它对你运行的命令做一层包装，并提供两项互补的能力：
+`gpulock` 的核心，是在命令运行期间为其包上一把读写锁。正确性类工作在读锁下共享 GPU（`check` / `read`），对性能敏感的工作则在写锁下独占 GPU（`perf` / `write`）。请求按**先到先服务**处理，因此源源不断的读者不会饿死正在等待的写者。这套加锁与排队是完全自包含的：它就是 `gpulock <mode> -- <cmd>` 的全部工作，无需任何后台服务即可运行。
 
-1. **加锁与排队。** 它为命令所使用的每一张 NVIDIA GPU 施加读写锁，并辅以**先到先服务**的排队机制。并发命令会有序地协调对 GPU 的访问，而非悄无声息地相互干扰。正确性类负载在读锁下共享 GPU（`check` / `read`）；对性能敏感的负载在写锁下独占 GPU（`perf` / `write`）。
-2. **空闲预留。** 当 GPU 本应空闲时，后台守护进程通过占用显存并维持利用率来预留它，避免该设备在任务之间被回收、被调度走或被降频。
+另有一个独立、可选的**守护服务**，用于解决另一个问题：在任务之间闲置的 GPU 常会被周边集群回收、调度走或降频，因此当一张卡本应闲置时，守护进程会用一个轻量的占位程序占住它——持有显存并维持利用率。
 
-这两项能力构成一个统一、一体化的系统。该空闲预留——包括其占用的显存与计算负载——会在命令通过 `gpulock` 取锁的瞬间被自动、临时地释放，并在 GPU 重新空闲后恢复。因此，预留空闲 GPU 绝不会干扰真实负载。
-
-```bash
-# 1. 安装 gpulock
-uv tool install -e . --force --reinstall --refresh --torch-backend auto
-
-# 2. 用守护服务预留空闲 GPU。
-#    守护除 GPU 0 外的所有 GPU，保留 GPU 0 用于不经包装的临时工作。
-n=$(nvidia-smi -L | wc -l)
-if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
-gpulock service install
-gpulock service config set gpu_ids="$gpu_list"
-gpulock service config set idle_timeout=315360000   # 约 10 年；实际上永不自动释放
-gpulock service config show
-gpulock service restart
-gpulock service status
-
-# 3. 让任意 GPU 命令都经过 gpulock 运行
-gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
-gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能）
-```
-
-这体现了共享主机上的一种常见策略。守护进程预留除 GPU 0 之外的所有 GPU，把 GPU 0 留给不经包装的临时命令、或尚未接入 `gpulock` 的 agent；请确认预留 `(n-1)/n` 张 GPU 仍满足你的利用率目标。`idle_timeout` 指**在没有任何 `gpulock` 活动**多少秒之后，守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用；此处设为约十年，**默认值为 `5400`（90 分钟）**。只有 `gpulock` 活动会重置该计时器——绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
+> **加锁与守护进程彼此独立。** 无论守护进程是否在运行，读写锁与排队都照常工作。二者只在一个方向上联动：当某条 `gpulock` 命令取锁时，该卡上守护进程的占位程序会被自动暂停——且仅在持锁期间暂停——使命令在一张干净的卡上运行；待 GPU 重新空闲后，占位程序再恢复。
 
 包装本身是透明的：`gpulock` 取锁、维持心跳、原样运行命令，并在退出时还锁。无需改动应用代码、容器镜像或任务框架。
 
@@ -135,14 +112,34 @@ gpulock service start
 
 ## 快速上手
 
+安装 `gpulock`，按需启动守护服务，然后让 GPU 命令都经过它运行：
+
 ```bash
-# 在 GPU 1 上以共享读锁运行正确性测试
-gpulock check 1 -- python tests/operator_correctness.py
+# 1. 安装
+uv tool install -e . --force --reinstall --refresh --torch-backend auto
 
-# 在 GPU 1 上以写锁独占运行 benchmark
-gpulock perf 1 -- ./build/operator_perf --case matmul_fp16 --size 4096
+# 2.（可选）用守护服务预留空闲 GPU。
+#    守护除 GPU 0 外的所有 GPU，保留 GPU 0 用于不经包装的临时工作。
+n=$(nvidia-smi -L | wc -l)
+if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
+gpulock service install
+gpulock service config set gpu_ids="$gpu_list"
+gpulock service config set idle_timeout=315360000   # 约 10 年；实际上永不自动释放
+gpulock service config show
+gpulock service restart
+gpulock service status
 
-# 跨两张 GPU 训练；命令运行前会先取得两张卡的锁
+# 3. 让任意 GPU 命令都经过 gpulock 运行
+gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
+gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能）
+```
+
+第 2 步是可选的，用于配置那个独立的守护服务。示例会预留除 GPU 0 之外的所有 GPU，把 GPU 0 留给不经包装的临时命令、或尚未接入 `gpulock` 的 agent；请确认预留 `(n-1)/n` 张 GPU 仍满足你的利用率目标。`idle_timeout` 指在**没有任何 `gpulock` 活动**多少秒之后守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用——其默认值为 `5400`（90 分钟），上面则设为约十年。只有 `gpulock` 活动会重置该计时器；绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
+
+再看几种常见写法：
+
+```bash
+# 一次锁定多张 GPU；命令运行前会先取得所有锁
 gpulock write 0,1 -- python train_multi_gpu.py
 
 # perf 默认会等待 GPU 空闲；当所有任务都已经过 gpulock 时可跳过该检查（取锁更快）
@@ -229,7 +226,7 @@ gpulock read 0 -- 'python test.py > out.log'
 
 ## 守护服务
 
-守护进程将空闲 GPU 预留下来，使其不被回收，并在真实任务开始时立即让出。它由 `supervisord` 托管。
+守护进程是可选的，且与加锁相互独立：无论是否安装它，`gpulock` 的读写锁行为都不变。运行时，它将空闲 GPU 预留下来、使其不被回收，并在真实任务开始时立即让出。它由 `supervisord` 托管。
 
 ```bash
 gpulock service install [--gpu-ids 0,1] [--idle-timeout 5400] \
