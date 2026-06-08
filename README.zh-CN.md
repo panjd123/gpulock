@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求)
 [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态)
 
-`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个编码 agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
+`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个 coding agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
 
 它对你运行的命令做一层包装，并提供两项互补的能力：
 
@@ -314,7 +314,7 @@ GPULOCK_LOCK_DIR  →  /var/lock/gpulock  →  /tmp/gpulock_locks
 
 ## 配合 AI Agent 使用
 
-当编码 agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md) 的内容加入目标项目的 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
+当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md) 的内容加入目标项目的 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
 
 ## 项目结构
 
