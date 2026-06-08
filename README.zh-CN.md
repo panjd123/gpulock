@@ -145,8 +145,8 @@ gpulock perf 1 -- ./build/operator_perf --case matmul_fp16 --size 4096
 # 跨两张 GPU 训练；命令运行前会先取得两张卡的锁
 gpulock write 0,1 -- python train_multi_gpu.py
 
-# benchmark 前等待 GPU 完全空闲
-gpulock perf 1 --wait-gpu-idle -- ./build/operator_perf
+# perf 默认会等待 GPU 空闲；当所有任务都已经过 gpulock 时可跳过该检查（取锁更快）
+gpulock perf 1 --no-wait-gpu-idle -- ./build/operator_perf
 ```
 
 在被包装的命令内部，`gpulock` 会注入以下环境变量：
@@ -173,9 +173,9 @@ gpulock write <gpu_ids> -- <cmd>     # perf 的别名
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `--wait-gpu-idle` | 关闭 | 仅 `perf`：GPU 繁忙时不报错，而是等待其变为空闲 |
+| `--no-wait-gpu-idle` | 关闭 | 仅 `perf`：跳过 GPU 空闲预检查，立即获取写锁（更快；仅当所有 GPU 任务都使用 `gpulock` 时安全） |
 | `--idle-streak-s` | 3 | `perf` 空闲预检查所需的连续 `util=0` 次数 |
-| `--idle-check-ms` | 100 | `--wait-gpu-idle` 的轮询间隔 |
+| `--idle-check-ms` | 100 | `perf` 空闲预检查的轮询间隔 |
 | `--poll-ms` | 200 | 取锁轮询间隔 |
 | `--timeout-s` | 1800 | 等待锁的最长时间 |
 | `--grace-age-s` | 180 | 陈旧锁保护期 |
@@ -187,13 +187,13 @@ gpulock write <gpu_ids> -- <cmd>     # perf 的别名
 - **`perf` / `write`** 获取*写锁*，它与读者及其他写者均互斥。
 - **公平排队。** 请求按到达顺序服务；源源不断的读者不会饿死正在等待的写者。
 - **多卡获取不会死锁。** 当一条命令需要锁定多张 GPU 时，`gpulock` 始终将 GPU 编号按升序排序，并按该顺序逐一获取锁；若任意一张获取失败或超时，则回滚所有已持有的锁。由于每个 `gpulock` 进程都按同一个全局顺序请求 GPU 锁，循环等待不可能发生：任一进程只会等待编号高于它当前所持有的全部锁的 GPU，因此"等待"关系在 GPU 编号上严格递增，无法构成环路。每张锁的超时（`--timeout-s`）则是额外的安全网。该保证依赖于升序获取——命令行会自动保证这一点；若你直接调用加锁 API，请按升序传入 GPU 编号以维持该性质。
-- **`perf` 空闲预检查。** 取写锁前，`gpulock` 通过 `nvidia-smi` 判断 GPU 是否繁忙：
+- **`perf` 空闲预检查（默认开启）。** 取写锁前，`perf` 会等待 GPU 变为空闲，以免 benchmark 被其他负载干扰——包括从未经过 `gpulock` 的任务。空闲与否通过 `nvidia-smi` 判断：
   - 忽略守护进程自身的 placeholder 进程；
   - 若没有其他计算进程，则 GPU **空闲**；
   - 若存在其他计算进程且 `util > 0`，则 GPU **繁忙**；
   - 若存在其他计算进程但 `util = 0`，则 GPU 仍视为**空闲**。
 
-  默认情况下，繁忙的 GPU 会让 `perf` 快速失败并给出解释性提示。加上 `--wait-gpu-idle` 则改为等待，直到 GPU 报告连续 `--idle-streak-s` 次 `util=0`（每 `--idle-check-ms` 轮询一次）。显存占用会记录到日志中，但本身不会被判定为繁忙。
+  `perf` 会等待，直到 GPU 报告连续 `--idle-streak-s` 次 `util=0`（每 `--idle-check-ms` 轮询一次），最长不超过锁超时。显存占用会记录到日志中，但本身不会被判定为繁忙。加上 `--no-wait-gpu-idle` 可跳过该预检查、立即取锁：这样更快，但仅当所有 GPU 任务都经过 `gpulock` 时才安全——因为那时锁本身就已经保证了独占访问。
 
 - **陈旧锁清理**有意设计得保守。只有当*以下全部*成立时锁才会被移除：PID 已死或缺失、已过保护期、GPU 上不再有计算进程，且其心跳与 mtime 在两次观察中保持稳定。若包装进程的父进程退出、但其子工作负载仍在 GPU 上运行，则锁会被保留。
 
@@ -291,8 +291,8 @@ GPULOCK_LOCK_DIR  →  /var/lock/gpulock  →  /tmp/gpulock_locks
 | `GPULOCK_GRACE_AGE_S` | 180 | 陈旧锁保护期 |
 | `GPULOCK_HEARTBEAT_S` | 2 | 心跳间隔 |
 | `GPULOCK_POLL_MS` | 200 | 取锁轮询间隔 |
-| `GPULOCK_IDLE_STREAK_S` | 3 | `--wait-gpu-idle` 所需的连续空闲检查次数 |
-| `GPULOCK_IDLE_CHECK_MS` | 100 | `--wait-gpu-idle` 的空闲轮询间隔 |
+| `GPULOCK_IDLE_STREAK_S` | 3 | `perf` 空闲预检查所需的连续空闲检查次数 |
+| `GPULOCK_IDLE_CHECK_MS` | 100 | `perf` 空闲预检查的轮询间隔 |
 | `GPULOCK_LOG_LEVEL` | INFO | 日志等级 |
 | `GPULOCK_LOG_STDOUT` | 0 | 是否将主命令日志同步到 stdout |
 | `GPULOCK_GUARD_LOG_STDOUT` | 1 | 是否将守护进程日志同步到 stdout |

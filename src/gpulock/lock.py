@@ -113,7 +113,7 @@ class GpuLock:
         physical_device_id: int,
         mode: str,
         config: Optional[LockConfig] = None,
-        wait_gpu_idle: bool = False,
+        skip_gpu_idle_check: bool = False,
         idle_streak_s: int = 3,
         idle_check_ms: int = 100,
         register_signals: bool = True,
@@ -136,7 +136,7 @@ class GpuLock:
         self.lock_path: Optional[Path] = None
         self.fd: Optional[int] = None
         self.start_time = time.time()
-        self.wait_gpu_idle = bool(wait_gpu_idle)
+        self.skip_gpu_idle_check = bool(skip_gpu_idle_check)
         self.idle_streak_s = max(int(idle_streak_s), 1)
         self.idle_check_ms = max(int(idle_check_ms), 100)
 
@@ -422,11 +422,14 @@ class GpuLock:
         return None
 
     def _ensure_write_lock_gpu_ready(self) -> None:
-        if self.mode != WRITE_MODE:
+        if self.mode != WRITE_MODE or self.skip_gpu_idle_check:
             return
 
+        # By default, perf waits until the GPU is idle before taking the write
+        # lock, so the benchmark is not skewed by other workloads — including jobs
+        # that never went through gpulock. Require idle_streak_s consecutive
+        # util=0 observations. --no-wait-gpu-idle skips this entirely.
         zero_util_streak = 0
-        busy_streak = 0
         deadline = time.monotonic() + self.config.timeout_s
         last_reason = ""
         while True:
@@ -436,19 +439,7 @@ class GpuLock:
 
             if busy:
                 zero_util_streak = 0
-                busy_streak += 1
-                if not self.wait_gpu_idle:
-                    if busy_streak < 2:
-                        time.sleep(self.idle_check_ms / 1000.0)
-                        continue
-                    raise RuntimeError(
-                        f"GPU{self.physical_device_id} appears busy before write lock ({reason}). "
-                        "Running perf with write lock may be inaccurate while other workloads are active. "
-                        "You can run correctness first with a read lock (gpulock check ...), "
-                        f"or add --wait-gpu-idle to wait for {self.idle_streak_s} consecutive util=0 checks."
-                    )
             else:
-                busy_streak = 0
                 zero_util_streak += 1
                 if zero_util_streak >= self.idle_streak_s:
                     return
@@ -457,7 +448,8 @@ class GpuLock:
                 raise TimeoutError(
                     f"Timeout while waiting for GPU{self.physical_device_id} to reach "
                     f"{self.idle_streak_s} consecutive util=0 checks before write lock "
-                    f"(last_state: {last_reason}, >{self.config.timeout_s}s)"
+                    f"(last_state: {last_reason}, >{self.config.timeout_s}s). "
+                    "Pass --no-wait-gpu-idle to skip this check."
                 )
             time.sleep(self.idle_check_ms / 1000.0)
 

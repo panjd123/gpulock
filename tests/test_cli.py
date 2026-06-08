@@ -23,7 +23,7 @@ def test_check_command_injects_cuda_visible_devices(run_cli):
 def test_run_flags_can_appear_before_or_after_gpu_ids():
     before = _parse_run_args([
         "perf",
-        "--wait-gpu-idle",
+        "--no-wait-gpu-idle",
         "0",
         "--",
         "echo",
@@ -32,14 +32,14 @@ def test_run_flags_can_appear_before_or_after_gpu_ids():
     after = _parse_run_args([
         "perf",
         "0",
-        "--wait-gpu-idle",
+        "--no-wait-gpu-idle",
         "--",
         "echo",
         "ok",
     ])
 
-    assert before.wait_gpu_idle is True
-    assert after.wait_gpu_idle is True
+    assert before.no_wait_gpu_idle is True
+    assert after.no_wait_gpu_idle is True
     assert before.command == ["--", "echo", "ok"]
     assert after.command == ["--", "echo", "ok"]
 
@@ -50,11 +50,11 @@ def test_child_flags_after_separator_are_not_parsed_as_run_flags():
         "0",
         "--",
         "echo",
-        "--wait-gpu-idle",
+        "--no-wait-gpu-idle",
     ])
 
-    assert args.wait_gpu_idle is False
-    assert args.command == ["--", "echo", "--wait-gpu-idle"]
+    assert args.no_wait_gpu_idle is False
+    assert args.command == ["--", "echo", "--no-wait-gpu-idle"]
 
 
 def test_multi_gpu_command_injects_comma_separated_devices(run_cli):

@@ -16,7 +16,7 @@ class MultiGpuLock:
     gpu_ids: list[int]
     mode: str
     config: LockConfig
-    wait_gpu_idle: bool = False
+    skip_gpu_idle_check: bool = False
     idle_streak_s: int = 3
     idle_check_ms: int = 100
     locks: list[GpuLock] = field(default_factory=list, init=False)
@@ -34,7 +34,7 @@ class MultiGpuLock:
                     gpu_id,
                     mode=self.mode,
                     config=self.config,
-                    wait_gpu_idle=self.wait_gpu_idle,
+                    skip_gpu_idle_check=self.skip_gpu_idle_check,
                     idle_streak_s=self.idle_streak_s,
                     idle_check_ms=self.idle_check_ms,
                     register_signals=False,

@@ -43,21 +43,25 @@ def _build_parser() -> argparse.ArgumentParser:
         run_parser.add_argument("--grace-age-s", type=int, default=env_config.grace_age_s)
         run_parser.add_argument("--heartbeat-s", type=int, default=env_config.heartbeat_s)
         run_parser.add_argument(
-            "--wait-gpu-idle",
+            "--no-wait-gpu-idle",
             action="store_true",
-            help="For perf, wait until GPU stays idle continuously before acquire.",
+            help=(
+                "For perf, skip the GPU-idle precheck and take the write lock "
+                "immediately. Faster, but only safe when every GPU job goes "
+                "through gpulock."
+            ),
         )
         run_parser.add_argument(
             "--idle-streak-s",
             type=int,
             default=_env_int("GPULOCK_IDLE_STREAK_S", 3),
-            help="Consecutive util=0 checks required by perf precheck (default 3).",
+            help="Consecutive util=0 checks required by the perf idle precheck (default 3).",
         )
         run_parser.add_argument(
             "--idle-check-ms",
             type=int,
             default=_env_int("GPULOCK_IDLE_CHECK_MS", 100),
-            help="Polling interval in ms for --wait-gpu-idle (default 100).",
+            help="Polling interval in ms for the perf idle precheck (default 100).",
         )
 
     add_run_parser("perf", WRITE_MODE, "run a command with an exclusive write lock")
@@ -119,10 +123,10 @@ def _run_locked_command(args: argparse.Namespace) -> int:
 
     gpu_ids_str = ",".join(str(g) for g in gpu_ids)
     log.info(
-        "cmd run request mode=%s gpus=%s wait_gpu_idle=%s idle_streak=%d idle_check_ms=%d argv=%s",
+        "cmd run request mode=%s gpus=%s skip_gpu_idle_check=%s idle_streak=%d idle_check_ms=%d argv=%s",
         mode,
         gpu_ids_str,
-        bool(args.wait_gpu_idle),
+        bool(args.no_wait_gpu_idle),
         max(args.idle_streak_s, 1),
         max(args.idle_check_ms, 100),
         " ".join(shlex.quote(x) for x in sys.argv),
@@ -151,7 +155,7 @@ def _run_locked_command(args: argparse.Namespace) -> int:
         gpu_ids=gpu_ids,
         mode=mode,
         config=cfg,
-        wait_gpu_idle=bool(args.wait_gpu_idle),
+        skip_gpu_idle_check=bool(args.no_wait_gpu_idle),
         idle_streak_s=max(args.idle_streak_s, 1),
         idle_check_ms=max(args.idle_check_ms, 100),
     )

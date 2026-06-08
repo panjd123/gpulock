@@ -186,8 +186,9 @@ gpulock perf 1 -- ./build/operator_perf --case matmul_fp16 --size 4096
 # Train across two GPUs; both locks are acquired before the command runs
 gpulock write 0,1 -- python train_multi_gpu.py
 
-# Wait until the GPU is fully idle before benchmarking
-gpulock perf 1 --wait-gpu-idle -- ./build/operator_perf
+# perf waits for the GPU to be idle by default; skip that check when every job
+# already goes through gpulock (faster acquire)
+gpulock perf 1 --no-wait-gpu-idle -- ./build/operator_perf
 ```
 
 Within the wrapped command, `gpulock` exports the following environment variables:
@@ -216,9 +217,9 @@ Per-run flags (see `gpulock <mode> --help` for the complete list):
 
 | Flag | Default | Meaning |
 |---|---:|---|
-| `--wait-gpu-idle` | off | `perf` only: wait for the GPU to become idle instead of erroring when it is busy |
+| `--no-wait-gpu-idle` | off | `perf` only: skip the GPU-idle precheck and take the write lock immediately (faster; safe only when every GPU job uses `gpulock`) |
 | `--idle-streak-s` | 3 | Consecutive `util=0` checks required by the `perf` idle precheck |
-| `--idle-check-ms` | 100 | Polling interval for `--wait-gpu-idle` |
+| `--idle-check-ms` | 100 | Polling interval for the `perf` idle precheck |
 | `--poll-ms` | 200 | Lock-acquisition polling interval |
 | `--timeout-s` | 1800 | Maximum time to wait for a lock |
 | `--grace-age-s` | 180 | Stale-lock protection window |
@@ -242,17 +243,21 @@ Per-run flags (see `gpulock <mode> --help` for the complete list):
   (`--timeout-s`) is an additional safety net. This guarantee relies on the ascending
   order, which the command line enforces automatically; if you drive the locking API
   directly, pass GPU IDs in ascending order to preserve it.
-- **`perf` idle precheck.** Before taking a write lock, `gpulock` determines whether
-  the GPU is busy via `nvidia-smi`:
+- **`perf` idle precheck (on by default).** Before taking a write lock, `perf` waits
+  until the GPU is idle, so that a benchmark is not skewed by other workloads —
+  including jobs that never went through `gpulock`. Idleness is determined via
+  `nvidia-smi`:
   - the guard's own placeholder processes are ignored;
   - if no other compute process is present, the GPU is **idle**;
   - if another compute process is present and `util > 0`, the GPU is **busy**;
   - if another compute process is present but `util = 0`, the GPU is still **idle**.
 
-  By default, a busy GPU causes `perf` to fail fast with an explanatory message. Pass
-  `--wait-gpu-idle` to instead wait until the GPU reports `--idle-streak-s`
-  consecutive `util=0` checks, polled every `--idle-check-ms`. Memory usage is
-  recorded in the logs but is not, on its own, treated as busy.
+  `perf` waits until the GPU reports `--idle-streak-s` consecutive `util=0` checks
+  (polled every `--idle-check-ms`), up to the lock timeout. Memory usage is recorded
+  in the logs but is not, on its own, treated as busy. Pass `--no-wait-gpu-idle` to
+  skip this precheck and take the lock immediately: this is faster, but safe only when
+  every GPU job goes through `gpulock`, because then the lock alone already guarantees
+  exclusive access.
 - **Stale-lock cleanup** is intentionally conservative. A lock is removed only when
   *all* of the following hold: its PID is dead or missing, it is past the protection
   window, no compute process remains on the GPU, and its heartbeat and mtime are
@@ -373,8 +378,8 @@ GPULOCK_LOCK_DIR  →  /var/lock/gpulock  →  /tmp/gpulock_locks
 | `GPULOCK_GRACE_AGE_S` | 180 | Stale-lock protection window |
 | `GPULOCK_HEARTBEAT_S` | 2 | Heartbeat interval |
 | `GPULOCK_POLL_MS` | 200 | Lock-acquisition polling interval |
-| `GPULOCK_IDLE_STREAK_S` | 3 | Consecutive idle checks required by `--wait-gpu-idle` |
-| `GPULOCK_IDLE_CHECK_MS` | 100 | Idle polling interval for `--wait-gpu-idle` |
+| `GPULOCK_IDLE_STREAK_S` | 3 | Consecutive idle checks required by the `perf` idle precheck |
+| `GPULOCK_IDLE_CHECK_MS` | 100 | Polling interval for the `perf` idle precheck |
 | `GPULOCK_LOG_LEVEL` | INFO | Log level |
 | `GPULOCK_LOG_STDOUT` | 0 | Mirror the main command's log to stdout |
 | `GPULOCK_GUARD_LOG_STDOUT` | 1 | Mirror the guard's log to stdout |
