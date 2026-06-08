@@ -17,14 +17,28 @@
 这两项能力构成一个统一、一体化的系统。该空闲预留——包括其占用的显存与计算负载——会在命令通过 `gpulock` 取锁的瞬间被自动、临时地释放，并在 GPU 重新空闲后恢复。因此，预留空闲 GPU 绝不会干扰真实负载。
 
 ```bash
-# 正确性运行：共享读锁，可与其他读锁并发
-gpulock check 0 -- python tests/test_kernel.py
+# 1. 安装 gpulock
+uv tool install -e . --force --reinstall --refresh --torch-backend auto
 
-# 性能运行：独占写锁，排除该 GPU 上的所有其他任务
-gpulock perf 0 -- python benchmarks/run.py
+# 2. 用守护服务预留空闲 GPU。
+#    守护除 GPU 0 外的所有 GPU，保留 GPU 0 用于不经包装的临时工作。
+n=$(nvidia-smi -L | wc -l)
+if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
+gpulock service install
+gpulock service config set gpu_ids="$gpu_list"
+gpulock service config set idle_timeout=315360000   # 约 10 年；实际上永不自动释放
+gpulock service config show
+gpulock service restart
+gpulock service status
+
+# 3. 让任意 GPU 命令都经过 gpulock 运行
+gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
+gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能）
 ```
 
-整个包装是透明的：`gpulock` 取锁、维持心跳、原样运行命令，并在退出时还锁。无需改动应用代码、容器镜像或任务框架。
+这体现了共享主机上的一种常见策略。守护进程预留除 GPU 0 之外的所有 GPU，把 GPU 0 留给不经包装的临时命令、或尚未接入 `gpulock` 的 agent；请确认预留 `(n-1)/n` 张 GPU 仍满足你的利用率目标。`idle_timeout` 指**在没有任何 `gpulock` 活动**多少秒之后，守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用；此处设为约十年，**默认值为 `5400`（90 分钟）**。只有 `gpulock` 活动会重置该计时器——绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
+
+包装本身是透明的：`gpulock` 取锁、维持心跳、原样运行命令，并在退出时还锁。无需改动应用代码、容器镜像或任务框架。
 
 `gpulock` 尤其适合运行大量并发任务的主机，例如多个编码 agent 共享同一组 GPU 的场景。由于每一次 GPU 访问都通过锁被串行化，并发的 agent 之间不会相互干扰。项目提供了一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](GPULOCK_AGENT_PROMPT.md)）；只需将其加入 agent 的指令，agent 即可正确地使用本工具。
 
@@ -231,7 +245,9 @@ gpulock service config set <key=value> [...]
 gpulock service config unset <key>
 ```
 
-**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。当守护进程在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行。在长时间无活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；后续活动会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
+**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有非 `gpulock` 的计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有 `gpulock` 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后只有 `gpulock` 活动才会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
+
+**什么算作"活动"。** `idle_timeout` / dormant 计时器**仅由 `gpulock` 驱动**——即持有 `gpulock` 锁，或发起一次 `gpulock` 运行。不经过 `gpulock` 的 GPU 任务**不会**重置该计时器，也**不会**唤醒休眠的 GPU；它在运行期间只会阻止 placeholder 被（重新）激活。
 
 **状态文件**位于 `${lock_root}/service/`：
 
@@ -253,7 +269,7 @@ guard.log
 | 键 | 默认值 | 含义 |
 |---|---:|---|
 | `gpu_ids` | 空 | 守护进程监控的 GPU；空值表示在启动时枚举所有可见 GPU |
-| `idle_timeout` | 5400 | 无 `gpulock` 活动超过多少秒后，GPU 进入 dormant 并释放其正在激活的 placeholder |
+| `idle_timeout` | 5400（90 分钟） | 无 `gpulock` 活动超过多少秒后，GPU 进入 dormant 并释放其正在激活的 placeholder。只有 `gpulock` 活动会计入；不经过 `gpulock` 的 GPU 任务不会重置它。 |
 | `placeholder_idle_s` | 1.0 | GPU 在无锁且无活动后需保持多少秒才会（重新）激活 placeholder。默认值明显高于连续 `gpulock` 运行之间的间隔，因此 placeholder 不会被插入到脚本的两步之间。 |
 
 `extra_env`、`python_executable`、`gpulock_executable` 同样保存在 `config.json` 中，通常由 `service install` 写入。若要修改 `extra_env`，请使用 `gpulock service config edit`。
