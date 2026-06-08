@@ -211,6 +211,16 @@ Per-run flags (see `gpulock <mode> --help` for the complete list):
   readers and other writers.
 - **Fair queuing.** Requests are served in arrival order; a continuous stream of
   readers does not starve a waiting writer.
+- **Multi-GPU acquisition is deadlock-free.** When a command locks several GPUs,
+  `gpulock` always sorts the IDs in ascending order and acquires the locks one at a
+  time in that order, rolling back every lock already held if any acquisition fails
+  or times out. Because every `gpulock` process requests GPU locks in the same global
+  order, a circular wait is impossible: a process only ever waits for a GPU whose ID
+  is higher than every lock it currently holds, so the "waits-for" relation is
+  strictly increasing in GPU ID and cannot form a cycle. The per-lock timeout
+  (`--timeout-s`) is an additional safety net. This guarantee relies on the ascending
+  order, which the command line enforces automatically; if you drive the locking API
+  directly, pass GPU IDs in ascending order to preserve it.
 - **`perf` idle precheck.** Before taking a write lock, `gpulock` determines whether
   the GPU is busy via `nvidia-smi`:
   - the guard's own placeholder processes are ignored;
