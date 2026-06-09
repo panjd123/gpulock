@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import signal
 import sqlite3
@@ -12,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from .gpu import gpu_indices, gpu_runtime_state_by_index, kill_visible_placeholder_compute_pids
+from .gpu import gpu_compute_pids, gpu_indices, gpu_runtime_state_by_index, kill_visible_placeholder_compute_pids
 from .lock import gpu_has_our_activity
 from .logging_setup import setup_guard_logger
 from .paths import read_lock_metadata, resolve_lock_root
@@ -27,6 +28,7 @@ from .placeholder import (
     wait_placeholder_ready,
 )
 from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
+from .service.common import guard_status_path
 
 
 def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
@@ -102,6 +104,33 @@ def _resolve_guard_gpu_ids(requested_gpu_ids: list[int]) -> list[int]:
     return deduped
 
 
+def _write_guard_status(lock_root: Path, snapshot: dict[str, object]) -> None:
+    path = guard_status_path(lock_root)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _last_activity_age_s(conn: sqlite3.Connection, gpu_id: int, now: float) -> float | None:
+    row = conn.execute(
+        "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
+        (gpu_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return max(now - float(row[0]), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _external_compute_pids(visible_pids: set[int], known_placeholder_pids: set[int]) -> set[int]:
+    return set(visible_pids) - set(known_placeholder_pids)
+
+
 def cmd_guard(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="gpulock guard")
     parser.add_argument(
@@ -129,6 +158,7 @@ def cmd_guard(argv: list[str]) -> int:
     placeholders: dict[int, subprocess.Popen] = {}
     placeholder_fail_reported: set[int] = set()
     placeholder_started_at: dict[int, float] = {}
+    placeholder_compute_pids_by_gpu: dict[int, set[int]] = {}
     placeholder_active: set[int] = set()
     idle_since: dict[int, float] = {}
     dormant: set[int] = set()
@@ -167,6 +197,7 @@ def cmd_guard(argv: list[str]) -> int:
         if existing is not None and existing.poll() is None:
             return True
         placeholder_active.discard(gid)
+        placeholder_compute_pids_by_gpu.pop(gid, None)
         if existing is None:
             status_ok, _ = placeholder_command(gpu_dir, "status", timeout_s=0.5)
             if status_ok:
@@ -174,6 +205,7 @@ def cmd_guard(argv: list[str]) -> int:
                 time.sleep(0.1)
             kill_placeholder(gpu_dir)
         placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
+        compute_pids_before = gpu_compute_pids(gid)
         proc = subprocess.Popen(
             [
                 sys.executable, "-m", "gpulock", "_placeholder",
@@ -203,6 +235,24 @@ def cmd_guard(argv: list[str]) -> int:
                 log.warning("gpu%d: placeholder worker failed to become ready", gid)
             return False
         (gpu_dir / "placeholder.pid").write_text(str(proc.pid))
+        compute_pids_after = gpu_compute_pids(gid)
+        new_compute_pids = compute_pids_after - compute_pids_before
+        if len(new_compute_pids) == 1:
+            placeholder_compute_pids_by_gpu[gid] = set(new_compute_pids)
+            log.info(
+                "gpu%d: mapped placeholder compute pid(s) from nvidia-smi: %s",
+                gid,
+                sorted(new_compute_pids),
+            )
+        else:
+            placeholder_compute_pids_by_gpu[gid] = set()
+            log.warning(
+                "gpu%d: could not uniquely map placeholder compute pid(s) "
+                "(before=%s after=%s); treating visible compute pids as external until mapping is known",
+                gid,
+                sorted(compute_pids_before),
+                sorted(compute_pids_after),
+            )
         placeholder_fail_reported.discard(gid)
         log.info("gpu%d: spawned placeholder worker (pid=%d)", gid, proc.pid)
         return True
@@ -215,6 +265,7 @@ def cmd_guard(argv: list[str]) -> int:
             placeholder_active.discard(gid)
             return
         placeholder_active.discard(gid)
+        placeholder_compute_pids_by_gpu.pop(gid, None)
         kill_placeholder(gpu_dir)
         kill_visible_placeholder_compute_pids(gid)
         log.warning("gpu%d: placeholder park failed, killed worker (%s)", gid, reason)
@@ -231,6 +282,100 @@ def cmd_guard(argv: list[str]) -> int:
             return
         log.warning("gpu%d: placeholder activate failed (%s)", gid, reason)
 
+    def external_gpu_compute_pids(gid: int) -> set[int] | None:
+        rt = gpu_runtime_state_by_index(gid)
+        if rt is None:
+            return None
+        visible_pids = gpu_compute_pids(gid)
+        known_placeholder_pids = placeholder_compute_pids_by_gpu.get(gid, set())
+        return _external_compute_pids(visible_pids, known_placeholder_pids)
+
+    def gpu_status_snapshot(gid: int) -> dict[str, object]:
+        gpu_dir = lock_root / f"gpu{gid}"
+        proc = placeholders.get(gid)
+        ph_alive = proc is not None and proc.poll() is None
+        state = placeholder_state(gpu_dir, timeout_s=0.2) if ph_alive else None
+        if state == "active":
+            placeholder_status = "active"
+        elif state == "parked":
+            placeholder_status = "parked"
+        elif ph_alive:
+            placeholder_status = "unknown"
+        else:
+            placeholder_status = "not_running"
+
+        now = time.time()
+        our_active = gpu_has_our_activity(lock_root, gid)
+        recent_pulse = _has_recent_pulse(last_pulse_ts, gid, max(args.placeholder_idle_s, 0.0))
+        rt = gpu_runtime_state_by_index(gid)
+        last_activity_age = _last_activity_age_s(conn, gid, now)
+        external_compute_pids = external_gpu_compute_pids(gid)
+
+        reason = "placeholder active"
+        if not ph_alive and gid in placeholder_fail_reported:
+            reason = "placeholder worker failed to start; see guard log"
+        elif gid in dormant:
+            reason = f"dormant: no gpulock activity for {args.idle_timeout}s"
+        elif our_active:
+            reason = "parked: gpulock lock or queue activity detected"
+        elif rt is None:
+            reason = "waiting: GPU runtime state unavailable from nvidia-smi"
+        elif external_compute_pids:
+            reason = (
+                "waiting: non-placeholder GPU process detected "
+                f"(compute_pids={sorted(external_compute_pids)})"
+            )
+        elif recent_pulse:
+            reason = "waiting: recent gpulock activity pulse"
+        elif gid in idle_since and placeholder_status != "active":
+            wait_remaining = max(args.placeholder_idle_s, 0.0) - max(now - idle_since[gid], 0.0)
+            reason = f"waiting: GPU idle grace period ({max(wait_remaining, 0.0):.1f}s remaining)"
+        elif ph_alive and placeholder_status == "parked":
+            reason = "parked: waiting for activation"
+        elif not ph_alive:
+            reason = "placeholder worker not running"
+
+        runtime: dict[str, object] | None = None
+        if rt is not None:
+            runtime = {
+                "util_gpu": rt.util_gpu,
+                "mem_used_mib": rt.mem_used_mib,
+                "mem_total_mib": rt.mem_total_mib,
+                "visible_compute_pids": rt.visible_compute_pids,
+                "visible_non_placeholder_pids": rt.visible_non_placeholder_pids,
+                "known_placeholder_compute_pids": sorted(placeholder_compute_pids_by_gpu.get(gid, set())),
+                "external_compute_pids": sorted(external_compute_pids or set()),
+            }
+
+        return {
+            "gpu_id": gid,
+            "placeholder": placeholder_status,
+            "placeholder_pid": proc.pid if ph_alive and proc is not None else None,
+            "dormant": gid in dormant,
+            "our_activity": our_active,
+            "recent_pulse": recent_pulse,
+            "idle_for_s": max(now - idle_since[gid], 0.0) if gid in idle_since else None,
+            "last_activity_age_s": last_activity_age,
+            "runtime": runtime,
+            "reason": reason,
+        }
+
+    def write_status_snapshot() -> None:
+        now = time.time()
+        _write_guard_status(
+            lock_root,
+            {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "updated_at": now,
+                "updated_at_text": time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(now)),
+                "gpu_ids": args.gpu_ids,
+                "idle_timeout": args.idle_timeout,
+                "placeholder_idle_s": args.placeholder_idle_s,
+                "gpus": [gpu_status_snapshot(gid) for gid in args.gpu_ids],
+            },
+        )
+
     def cleanup() -> None:
         for gid, proc in placeholders.items():
             gpu_dir = lock_root / f"gpu{gid}"
@@ -244,7 +389,9 @@ def cmd_guard(argv: list[str]) -> int:
             placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
         placeholders.clear()
         placeholder_started_at.clear()
+        placeholder_compute_pids_by_gpu.clear()
         placeholder_active.clear()
+        guard_status_path(lock_root).unlink(missing_ok=True)
         conn.close()
 
     def on_signal(_sig, _frame):
@@ -274,9 +421,11 @@ def cmd_guard(argv: list[str]) -> int:
             continue
         # Don't activate placeholder if non-placeholder processes are using GPU.
         rt = gpu_runtime_state_by_index(gid)
-        if rt is not None and rt.visible_non_placeholder_pids > 0:
+        external_compute_pids = external_gpu_compute_pids(gid)
+        if external_compute_pids:
             continue
         activate_placeholder_worker(gid, "guard startup idle")
+    write_status_snapshot()
 
     try:
         while True:
@@ -295,6 +444,7 @@ def cmd_guard(argv: list[str]) -> int:
                             stderr_text = placeholders[gid].stderr.read().strip()
                     del placeholders[gid]
                     placeholder_started_at.pop(gid, None)
+                    placeholder_compute_pids_by_gpu.pop(gid, None)
                     placeholder_active.discard(gid)
                     pid_file.unlink(missing_ok=True)
                     placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
@@ -353,7 +503,8 @@ def cmd_guard(argv: list[str]) -> int:
                         # are actively using this GPU (e.g. training outlived its
                         # gpulock wrapper).
                         rt = gpu_runtime_state_by_index(gid)
-                        if rt is not None and rt.visible_non_placeholder_pids > 0:
+                        external_compute_pids = external_gpu_compute_pids(gid)
+                        if external_compute_pids:
                             idle_since[gid] = now  # reset idle timer
                         else:
                             activate_placeholder_worker(gid, "gpu idle")
@@ -366,6 +517,7 @@ def cmd_guard(argv: list[str]) -> int:
                         log.info("gpu%d: dormant (no user activity for %ds)", gid, args.idle_timeout)
 
             conn.commit()
+            write_status_snapshot()
             now_ts = time.time()
             if now_ts - last_history_prune_ts >= 86400.0:
                 deleted = _prune_activity_history(conn, now_ts)

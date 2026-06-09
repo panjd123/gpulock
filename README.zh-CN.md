@@ -94,11 +94,21 @@
 
 ## 安装
 
+使用 `uv`：
+
 ```bash
 uv tool install -e . --force --reinstall --refresh --torch-backend auto
 ```
 
-`torch` 被声明为普通且不固定版本的依赖；`--torch-backend auto` 让 `uv` 为当前机器选择合适的 PyTorch wheel。若你想自行管理 PyTorch，普通的 `pip install -e .` 同样可用。
+使用 `pip`：
+
+```bash
+pip install -e .
+```
+
+`torch` 被声明为普通且不固定版本的依赖；`--torch-backend auto` 让 `uv`
+为当前机器选择合适的 PyTorch wheel。使用 `pip` 时，请确认它安装的 PyTorch
+wheel 适配当前 CUDA / driver 环境，或先自行安装并管理 PyTorch。
 
 安装守护服务但不立即启动：
 
@@ -117,6 +127,8 @@ gpulock service start
 ```bash
 # 1. 安装
 uv tool install -e . --force --reinstall --refresh --torch-backend auto
+# 或：
+pip install -e .
 
 # 2.（可选）用守护服务预留空闲 GPU。
 #    守护除 GPU 0 外的所有 GPU，保留 GPU 0 用于不经包装的临时工作。

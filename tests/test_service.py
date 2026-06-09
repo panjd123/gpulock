@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from gpulock.guard import _external_compute_pids
 from gpulock.service import common, supervisor
 from gpulock.service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
 
@@ -102,6 +103,7 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert proc.returncode == 3
     assert "installed:    yes" in proc.stdout
     assert "supervisord:  stopped" in proc.stdout
+    assert "guard status:" not in proc.stdout
 
     proc = run_cli(["service", "config", "path"])
     assert proc.returncode == 0
@@ -152,6 +154,83 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert proc.returncode == 0, proc.stderr
     assert not (service_dir / "config.json").exists()
     assert not (service_dir / "supervisord.conf").exists()
+
+
+def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
+    service_dir = lock_root / "service"
+    cfg = common.GuardServiceConfig(gpu_ids=[0], idle_timeout=600)
+    cfg.save()
+    supervisor.write_conf(cfg)
+    (service_dir / "supervisord.pid").write_text(str(os.getpid()))
+    now = time.time()
+    (service_dir / "guard.status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "updated_at": now,
+                "updated_at_text": "2026-06-09 12:00:00 +0800",
+                "gpu_ids": [0],
+                "idle_timeout": 600,
+                "placeholder_idle_s": 1.0,
+                "gpus": [
+                    {
+                        "gpu_id": 0,
+                        "placeholder": "parked",
+                        "placeholder_pid": 12345,
+                        "dormant": False,
+                        "our_activity": False,
+                        "recent_pulse": False,
+                        "idle_for_s": 0.4,
+                        "last_activity_age_s": 42.0,
+                        "runtime": {
+                            "util_gpu": 0,
+                            "mem_used_mib": 100,
+                            "mem_total_mib": 80000,
+                            "visible_compute_pids": 1,
+                            "visible_non_placeholder_pids": 1,
+                        },
+                        "reason": "waiting: non-placeholder GPU process detected (visible_non_placeholder_pids=1)",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_supervisorctl(*_args, **_kwargs):
+        return (0, "gpulock-guard RUNNING pid 123, uptime 0:00:03\n", "")
+
+    monkeypatch.setattr(supervisor, "_supervisorctl", fake_supervisorctl)
+    rc = supervisor.status()
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "program:      gpulock-guard RUNNING" in captured.out
+    assert "guard status: updated" in captured.out
+    assert "gpu0: placeholder=parked pid=12345" in captured.out
+    assert "non_placeholder_pids=1" in captured.out
+    assert "reason=waiting: non-placeholder GPU process detected" in captured.out
+
+
+def test_service_stop_cleans_orphan_placeholder_files(run_cli, lock_root):
+    gpu_dir = lock_root / "gpu0"
+    gpu_dir.mkdir()
+    (gpu_dir / "placeholder.pid").write_text("999999999")
+    (gpu_dir / "placeholder.sock").touch()
+
+    proc = run_cli(["service", "stop"])
+
+    assert proc.returncode == 0, proc.stderr
+    assert "supervisord not running" in proc.stdout
+    assert not (gpu_dir / "placeholder.pid").exists()
+    assert not (gpu_dir / "placeholder.sock").exists()
+
+
+def test_guard_external_compute_pids_excludes_only_mapped_placeholder_pids():
+    assert _external_compute_pids({101}, {101}) == set()
+    assert _external_compute_pids({101, 202}, {101}) == {202}
+    assert _external_compute_pids({101}, set()) == {101}
 
 
 def test_supervisord_daemon_lifecycle(run_cli, lock_root):

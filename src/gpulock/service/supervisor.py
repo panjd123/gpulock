@@ -14,6 +14,7 @@ Wraps the third-party ``supervisor`` package. All state lives under
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shlex
 import signal
@@ -23,7 +24,8 @@ import time
 from pathlib import Path
 
 from ..gpu import pid_exists
-from .common import GuardServiceConfig, chmod_quiet, say, service_dir, warn
+from ..placeholder import placeholder_socket_path, stop_placeholder
+from .common import GuardServiceConfig, chmod_quiet, guard_status_path, say, service_dir, warn
 
 
 PROGRAM_NAME = "gpulock-guard"
@@ -93,6 +95,42 @@ def supervisor_available() -> tuple[bool, str]:
 def _cleanup_stale() -> None:
     pid_path().unlink(missing_ok=True)
     sock_path().unlink(missing_ok=True)
+
+
+def _cleanup_placeholder_workers(timeout_s: float = 5.0) -> None:
+    """Best-effort cleanup for placeholder workers left under this lock root.
+
+    The guard starts placeholders in their own sessions so a hard supervisor
+    shutdown does not necessarily kill them as part of the guard process group.
+    `service stop/restart/uninstall` should still leave no service-owned
+    placeholder behind, including GPUs removed from the new config.
+    """
+    root = service_dir().parent
+    for pid_file in sorted(root.glob("gpu*/placeholder.pid")):
+        gpu_dir = pid_file.parent
+        with contextlib.suppress(Exception):
+            stop_placeholder(gpu_dir, timeout_s=1.0)
+
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid_file.unlink(missing_ok=True)
+            placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
+            continue
+
+        deadline = time.monotonic() + max(timeout_s, 0.1)
+        while time.monotonic() < deadline and pid_exists(pid):
+            time.sleep(0.1)
+        if pid_exists(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+            time.sleep(0.2)
+        if pid_exists(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+        pid_file.unlink(missing_ok=True)
+        placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
 
 
 # --- conf rendering ------------------------------------------------------
@@ -253,6 +291,7 @@ def start() -> int:
 def stop(timeout_s: float = 30.0) -> int:
     pid = running_pid()
     if pid == 0:
+        _cleanup_placeholder_workers()
         _cleanup_stale()
         say("supervisord not running")
         return 0
@@ -266,6 +305,7 @@ def stop(timeout_s: float = 30.0) -> int:
     deadline = time.monotonic() + max(timeout_s, 1.0)
     while time.monotonic() < deadline:
         if not pid_exists(pid):
+            _cleanup_placeholder_workers()
             _cleanup_stale()
             say(f"supervisord stopped (pid={pid})")
             return 0
@@ -276,6 +316,7 @@ def stop(timeout_s: float = 30.0) -> int:
     time.sleep(0.5)
     with contextlib.suppress(OSError):
         os.kill(pid, signal.SIGKILL)
+    _cleanup_placeholder_workers()
     _cleanup_stale()
     warn(f"supervisord force-killed (pid={pid})")
     return 0
@@ -284,6 +325,79 @@ def stop(timeout_s: float = 30.0) -> int:
 def restart() -> int:
     rc = stop()
     return rc if rc != 0 else start()
+
+
+def _format_optional_seconds(value: object) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        return f"{float(value):.1f}s"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _print_guard_snapshot() -> None:
+    path = guard_status_path()
+    if not path.exists():
+        print(f"guard status: missing ({path})")
+        print("guard detail: no guard snapshot yet; check guard log if the service just started")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"guard status: unreadable ({path}: {e})")
+        return
+
+    updated = data.get("updated_at")
+    age_text = "unknown age"
+    stale_text = ""
+    try:
+        age_s = max(time.time() - float(updated), 0.0)
+        age_text = f"{age_s:.1f}s ago"
+        if age_s > 10.0:
+            stale_text = " (stale)"
+    except (TypeError, ValueError):
+        pass
+    updated_text = str(data.get("updated_at_text") or "<unknown>")
+    print(f"guard status: updated {age_text}{stale_text} ({updated_text})")
+
+    gpus = data.get("gpus", [])
+    if not isinstance(gpus, list) or not gpus:
+        print("gpu status:   <none>")
+        return
+
+    print("gpu status:")
+    for item in gpus:
+        if not isinstance(item, dict):
+            continue
+        gpu_id = item.get("gpu_id", "?")
+        placeholder = item.get("placeholder", "unknown")
+        pid = item.get("placeholder_pid")
+        pid_text = f" pid={pid}" if pid else ""
+        reason = item.get("reason", "unknown")
+        runtime = item.get("runtime")
+        runtime_text = ""
+        if isinstance(runtime, dict):
+            runtime_text = (
+                f" util={runtime.get('util_gpu', '?')}%"
+                f" mem={runtime.get('mem_used_mib', '?')}/{runtime.get('mem_total_mib', '?')}MiB"
+                f" compute_pids={runtime.get('visible_compute_pids', '?')}"
+                f" non_placeholder_pids={runtime.get('visible_non_placeholder_pids', '?')}"
+            )
+            if "known_placeholder_compute_pids" in runtime:
+                runtime_text += f" known_placeholder_pids={runtime.get('known_placeholder_compute_pids', [])}"
+            if "external_compute_pids" in runtime:
+                runtime_text += f" external_pids={runtime.get('external_compute_pids', [])}"
+        idle_for = item.get("idle_for_s")
+        last_activity_age = item.get("last_activity_age_s")
+        timing_text = (
+            f" idle_for={_format_optional_seconds(idle_for)}"
+            f" last_gpulock_activity={_format_optional_seconds(last_activity_age)}"
+        )
+        print(
+            f"  gpu{gpu_id}: placeholder={placeholder}{pid_text};"
+            f"{runtime_text}{timing_text}; reason={reason}"
+        )
 
 
 def status() -> int:
@@ -317,6 +431,7 @@ def status() -> int:
             print(f"program:      {line}")
     if rc != 0 and err.strip():
         print(err.strip(), file=sys.stderr)
+    _print_guard_snapshot()
     return rc
 
 

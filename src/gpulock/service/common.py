@@ -14,6 +14,7 @@ from ..paths import resolve_lock_root
 _PREFIX = "[gpulock service]"
 DEFAULT_IDLE_TIMEOUT = 5400
 DEFAULT_PLACEHOLDER_IDLE_S = 1.0
+GUARD_STATUS_FILENAME = "guard.status.json"
 
 
 def say(msg: str) -> None:
@@ -40,6 +41,11 @@ def service_dir(lock_root: Path | None = None) -> Path:
     path = root / "service"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
+
+
+def guard_status_path(lock_root: Path | None = None) -> Path:
+    """Path to the guard's machine-readable status snapshot."""
+    return service_dir(lock_root) / GUARD_STATUS_FILENAME
 
 
 @dataclass

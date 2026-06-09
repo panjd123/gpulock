@@ -129,13 +129,22 @@ On a host shared by many tasks, two problems recur:
 
 ## Installation
 
+With `uv`:
+
 ```bash
 uv tool install -e . --force --reinstall --refresh --torch-backend auto
 ```
 
+With `pip`:
+
+```bash
+pip install -e .
+```
+
 `torch` is declared as an ordinary, unpinned dependency; `--torch-backend auto` lets
-`uv` select the appropriate PyTorch wheel for the current machine. A plain
-`pip install -e .` also works if you manage PyTorch yourself.
+`uv` select the appropriate PyTorch wheel for the current machine. When using `pip`,
+make sure the PyTorch wheel it installs is appropriate for your CUDA / driver setup,
+or install/manage PyTorch yourself first.
 
 To install the guard service without starting it immediately:
 
@@ -156,6 +165,8 @@ through it:
 ```bash
 # 1. Install
 uv tool install -e . --force --reinstall --refresh --torch-backend auto
+# or:
+pip install -e .
 
 # 2. (Optional) reserve idle GPUs with the guard service.
 #    This guards every GPU except GPU 0, leaving GPU 0 free for quick, unwrapped work.
