@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import logging
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from gpulock import config, gpu, lock, placeholder
+from gpulock import config, gpu, guard, lock, placeholder
 from gpulock.guard import _init_guard_db
 from gpulock.config import GpuRuntimeState
 from gpulock.service.common import DEFAULT_PLACEHOLDER_IDLE_S
@@ -316,6 +317,63 @@ def _write_fake_placeholder_deps(module_dir: Path) -> None:
         "    return object()\n",
         encoding="utf-8",
     )
+
+
+def test_wait_placeholder_process_ready_fails_fast_when_worker_exits(lock_root, monkeypatch):
+    gpu_dir = lock_root / "gpu99"
+    gpu_dir.mkdir()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(7)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    calls = 0
+
+    def fake_placeholder_command(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return (False, "missing socket")
+
+    monkeypatch.setattr(guard, "placeholder_command", fake_placeholder_command)
+    start = time.monotonic()
+
+    ready = guard._wait_placeholder_process_ready(gpu_dir, proc, timeout_s=30.0)
+
+    assert ready is False
+    assert time.monotonic() - start < 2.0
+    assert proc.wait(timeout=2) == 7
+    assert calls >= 0
+
+
+def test_guard_exits_after_consecutive_placeholder_start_failures(lock_root, tmp_path, monkeypatch):
+    logger = logging.getLogger("gpulock.guard")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    fake_modules = tmp_path / "fake-modules"
+    fake_modules.mkdir()
+    (fake_modules / "setproctitle.py").write_text(
+        "def setproctitle(_title):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    (fake_modules / "torch.py").write_text(
+        "raise ImportError('libtorch_cuda.so: undefined symbol: ncclCommResume')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("PYTHONPATH", f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}")
+    monkeypatch.setattr(guard, "PLACEHOLDER_START_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(guard, "PLACEHOLDER_START_FAILURE_EXIT_THRESHOLD", 2)
+
+    rc = guard.cmd_guard(["98", "99", "--placeholder-idle-s", "0.01", "--idle-timeout", "30"])
+
+    assert rc == 70
+    log_text = (lock_root / "guard.log").read_text(encoding="utf-8")
+    assert "undefined symbol: ncclCommResume" in log_text
+    assert "exiting guard for supervisor restart" in log_text
 
 
 def _run_repeated_gpulock_commands(env: dict[str, str], gpu_id: int, count: int) -> tuple[list[float], list[float]]:

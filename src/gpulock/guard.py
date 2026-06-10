@@ -25,10 +25,13 @@ from .placeholder import (
     placeholder_socket_path,
     placeholder_state,
     stop_placeholder,
-    wait_placeholder_ready,
 )
 from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
 from .service.common import guard_status_path
+
+
+PLACEHOLDER_START_TIMEOUT_S = 60.0
+PLACEHOLDER_START_FAILURE_EXIT_THRESHOLD = 3
 
 
 def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
@@ -131,6 +134,31 @@ def _external_compute_pids(visible_pids: set[int], known_placeholder_pids: set[i
     return set(visible_pids) - set(known_placeholder_pids)
 
 
+def _wait_placeholder_process_ready(
+    gpu_dir: Path,
+    proc: subprocess.Popen,
+    timeout_s: float = PLACEHOLDER_START_TIMEOUT_S,
+) -> bool:
+    """Wait until the placeholder answers status, but fail fast if it exits."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        ok, _ = placeholder_command(gpu_dir, "status", timeout_s=0.5)
+        if ok:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _collect_process_stderr(proc: subprocess.Popen) -> str:
+    if proc.stderr is None:
+        return ""
+    with contextlib.suppress(Exception):
+        return proc.stderr.read().strip()
+    return ""
+
+
 def cmd_guard(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="gpulock guard")
     parser.add_argument(
@@ -160,6 +188,8 @@ def cmd_guard(argv: list[str]) -> int:
     placeholder_started_at: dict[int, float] = {}
     placeholder_compute_pids_by_gpu: dict[int, set[int]] = {}
     placeholder_active: set[int] = set()
+    consecutive_placeholder_start_failures = 0
+    should_exit_for_placeholder_failures = False
     idle_since: dict[int, float] = {}
     dormant: set[int] = set()
     last_pulse_ts: dict[int, float] = {}
@@ -191,6 +221,7 @@ def cmd_guard(argv: list[str]) -> int:
         log.info("gpu%d: gpulock activity mode=%s pid=%s cmd=%s", gid, mode, pid, cmd)
 
     def ensure_placeholder_worker(gid: int) -> bool:
+        nonlocal consecutive_placeholder_start_failures, should_exit_for_placeholder_failures
         gpu_dir = lock_root / f"gpu{gid}"
         gpu_dir.mkdir(parents=True, exist_ok=True)
         existing = placeholders.get(gid)
@@ -218,21 +249,25 @@ def cmd_guard(argv: list[str]) -> int:
         )
         placeholders[gid] = proc
         placeholder_started_at[gid] = time.time()
-        if not wait_placeholder_ready(gpu_dir, timeout_s=60.0):
+        if not _wait_placeholder_process_ready(gpu_dir, proc, timeout_s=PLACEHOLDER_START_TIMEOUT_S):
             with contextlib.suppress(Exception):
                 proc.terminate()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
             placeholders.pop(gid, None)
             placeholder_started_at.pop(gid, None)
-            stderr_text = ""
-            if proc.stderr is not None:
-                with contextlib.suppress(Exception):
-                    stderr_text = proc.stderr.read().strip()
+            stderr_text = _collect_process_stderr(proc)
             if stderr_text:
                 log.warning("gpu%d: placeholder worker failed to become ready: %s", gid, stderr_text)
             else:
                 log.warning("gpu%d: placeholder worker failed to become ready", gid)
+            consecutive_placeholder_start_failures += 1
+            if consecutive_placeholder_start_failures >= PLACEHOLDER_START_FAILURE_EXIT_THRESHOLD:
+                should_exit_for_placeholder_failures = True
+                log.error(
+                    "placeholder worker failed to start %d consecutive times; exiting guard for supervisor restart",
+                    consecutive_placeholder_start_failures,
+                )
             return False
         (gpu_dir / "placeholder.pid").write_text(str(proc.pid))
         compute_pids_after = gpu_compute_pids(gid)
@@ -254,6 +289,7 @@ def cmd_guard(argv: list[str]) -> int:
                 sorted(compute_pids_after),
             )
         placeholder_fail_reported.discard(gid)
+        consecutive_placeholder_start_failures = 0
         log.info("gpu%d: spawned placeholder worker (pid=%d)", gid, proc.pid)
         return True
 
@@ -407,6 +443,9 @@ def cmd_guard(argv: list[str]) -> int:
     for gid in args.gpu_ids:
         _touch_last_activity(conn, gid, startup_ts)
         ensure_placeholder_worker(gid)
+        if should_exit_for_placeholder_failures:
+            cleanup()
+            return 70
     conn.commit()
     _prune_activity_history(conn, startup_ts)
     conn.commit()
@@ -425,6 +464,9 @@ def cmd_guard(argv: list[str]) -> int:
         if external_compute_pids:
             continue
         activate_placeholder_worker(gid, "guard startup idle")
+        if should_exit_for_placeholder_failures:
+            cleanup()
+            return 70
     write_status_snapshot()
 
     try:
@@ -508,6 +550,9 @@ def cmd_guard(argv: list[str]) -> int:
                             idle_since[gid] = now  # reset idle timer
                         else:
                             activate_placeholder_worker(gid, "gpu idle")
+                            if should_exit_for_placeholder_failures:
+                                cleanup()
+                                return 70
                             if gid in placeholder_active:
                                 idle_since.pop(gid, None)
                     if ph_alive and gid in placeholder_active and not _has_recent_activity(conn, gid, args.idle_timeout):
