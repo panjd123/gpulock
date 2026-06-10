@@ -156,6 +156,79 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert not (service_dir / "supervisord.conf").exists()
 
 
+def test_service_config_preset_seed_selects_guarded_gpus(run_cli, lock_root, cli_env, tmp_path):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "printf '0\\n1\\n2\\n'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli(["service", "install", "--no-start"])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "seed"])
+    assert proc.returncode == 0, proc.stderr
+    assert "applied preset seed" in proc.stdout
+    assert "service restart" in proc.stdout
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [1, 2]
+    assert saved_cfg["idle_timeout"] == 315360000
+
+
+def test_service_config_preset_seed_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "printf '0\\n'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "9"])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "seed"])
+    assert proc.returncode == 0, proc.stderr
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [0]
+    assert saved_cfg["idle_timeout"] == 315360000
+
+
+def test_service_config_preset_seed_fails_without_detected_gpus(
+    run_cli,
+    lock_root,
+    cli_env,
+    tmp_path,
+):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "4"])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "seed"])
+    assert proc.returncode == 2
+    assert "no GPUs found" in proc.stderr
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [4]
+
+
 def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
     service_dir = lock_root / "service"
     cfg = common.GuardServiceConfig(gpu_ids=[0], idle_timeout=600)

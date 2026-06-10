@@ -169,14 +169,7 @@ uv tool install -e . --force --reinstall --refresh --torch-backend auto
 pip install -e .
 
 # 2. (Optional) reserve idle GPUs with the guard service.
-#    This guards every GPU except GPU 0, leaving GPU 0 free for quick, unwrapped work.
-n=$(nvidia-smi -L | wc -l)
-if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
 gpulock service install
-gpulock service config set gpu_ids="$gpu_list"
-gpulock service config set idle_timeout=315360000   # ~10 years; effectively never auto-release
-gpulock service config show
-gpulock service restart
 gpulock service status
 
 # 3. Run any GPU command through gpulock
@@ -184,14 +177,11 @@ gpulock check 0 -- python tests/test_kernel.py      # shared read lock    (corre
 gpulock perf  0 -- python benchmarks/run.py         # exclusive write lock (performance)
 ```
 
-Step 2 is optional and configures the standalone guard service. The example reserves
-every GPU except GPU 0, leaving GPU 0 free for quick commands or agents not yet wired
-to use `gpulock`; check that reserving `(n-1)/n` GPUs still meets your utilization
-target. `idle_timeout` is the number of seconds *without any `gpulock` activity* after
-which the guard releases a GPU, so a forgotten host is not held forever — it defaults
-to `5400` (90 minutes) and is set to roughly ten years above. Only `gpulock` activity
-resets this timer; GPU work that bypasses `gpulock` does not (see
-[The guard service](#the-guard-service)).
+Step 2 is optional and configures the standalone guard service. `idle_timeout` is the
+number of seconds *without any `gpulock` activity* after which the guard releases a
+GPU, so a forgotten host is not held forever; it defaults to `5400` (90 minutes).
+Only `gpulock` activity resets this timer; GPU work that bypasses `gpulock` does not
+(see [The guard service](#the-guard-service)).
 
 A few more patterns:
 

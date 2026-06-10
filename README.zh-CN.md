@@ -131,14 +131,7 @@ uv tool install -e . --force --reinstall --refresh --torch-backend auto
 pip install -e .
 
 # 2.（可选）用守护服务预留空闲 GPU。
-#    守护除 GPU 0 外的所有 GPU，保留 GPU 0 用于不经包装的临时工作。
-n=$(nvidia-smi -L | wc -l)
-if (( n > 1 )); then gpu_list=$(seq -s, 1 $((n - 1))); else gpu_list="0"; fi
 gpulock service install
-gpulock service config set gpu_ids="$gpu_list"
-gpulock service config set idle_timeout=315360000   # 约 10 年；实际上永不自动释放
-gpulock service config show
-gpulock service restart
 gpulock service status
 
 # 3. 让任意 GPU 命令都经过 gpulock 运行
@@ -146,7 +139,7 @@ gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确�
 gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能）
 ```
 
-第 2 步是可选的，用于配置那个独立的守护服务。示例会预留除 GPU 0 之外的所有 GPU，把 GPU 0 留给不经包装的临时命令、或尚未接入 `gpulock` 的 agent；请确认预留 `(n-1)/n` 张 GPU 仍满足你的利用率目标。`idle_timeout` 指在**没有任何 `gpulock` 活动**多少秒之后守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用——其默认值为 `5400`（90 分钟），上面则设为约十年。只有 `gpulock` 活动会重置该计时器；绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
+第 2 步是可选的，用于配置那个独立的守护服务。`idle_timeout` 指在**没有任何 `gpulock` 活动**多少秒之后守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用；其默认值为 `5400`（90 分钟）。只有 `gpulock` 活动会重置该计时器；绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
 
 再看几种常见写法：
 

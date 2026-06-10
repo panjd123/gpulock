@@ -9,6 +9,7 @@ import subprocess
 import sys
 from typing import Any, Callable
 
+from ..gpu import gpu_indices
 from . import supervisor as supervisor_backend
 from .common import (
     DEFAULT_IDLE_TIMEOUT,
@@ -62,6 +63,8 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
 }
+_SEED_IDLE_TIMEOUT = 315360000
+_CONFIG_PRESETS = ("seed",)
 
 
 def _validate_key(key: str) -> None:
@@ -143,6 +146,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("kv", nargs="+", metavar="KEY=VALUE", help=f"settable keys: {keys_help}")
     p_unset = cfg_sub.add_parser("unset", help="reset one config value to its default")
     p_unset.add_argument("key", help=f"one of: {keys_help}")
+    p_preset = cfg_sub.add_parser("preset", help="apply a named config preset")
+    p_preset.add_argument("name", choices=_CONFIG_PRESETS, help="preset name")
     cfg_sub.add_parser("edit", help="open the config file in $EDITOR")
 
     return parser
@@ -226,6 +231,37 @@ def _config_unset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _seed_gpu_ids() -> list[int]:
+    ids = sorted(set(gpu_indices()))
+    if not ids:
+        raise ValueError("no GPUs found via nvidia-smi")
+    if len(ids) == 1:
+        return ids
+    return ids[1:]
+
+
+def _config_preset(args: argparse.Namespace) -> int:
+    cfg = _load_cfg()
+    if args.name == "seed":
+        try:
+            cfg.gpu_ids = _seed_gpu_ids()
+        except ValueError as e:
+            warn(f"cannot apply preset {args.name!r}: {e}")
+            return 2
+        cfg.idle_timeout = _SEED_IDLE_TIMEOUT
+    else:
+        warn(f"unknown preset {args.name!r}; presets: {', '.join(_CONFIG_PRESETS)}")
+        return 2
+    cfg.save()
+    say(
+        f"applied preset {args.name}: "
+        f"gpu_ids={_format_value('gpu_ids', cfg.gpu_ids)} "
+        f"idle_timeout={cfg.idle_timeout}"
+    )
+    say("apply with: gpulock service restart")
+    return 0
+
+
 def _config_edit(_args: argparse.Namespace) -> int:
     path = GuardServiceConfig.config_path()
     if not path.exists():
@@ -253,6 +289,7 @@ _CONFIG_ACTIONS: dict[str, Callable[[argparse.Namespace], int]] = {
     "get": _config_get,
     "set": _config_set,
     "unset": _config_unset,
+    "preset": _config_preset,
     "edit": _config_edit,
 }
 
