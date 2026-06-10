@@ -58,6 +58,19 @@ def test_agent_local_and_global_differ_only_in_preamble(run_cli):
     assert local_block == glob_block
 
 
+def test_agent_help_lists_per_tool_install_commands(run_cli):
+    proc = run_cli(["agent", "--help"])
+
+    assert proc.returncode == 0, proc.stderr
+    for snippet in (
+        "codex exec --skip-git-repo-check",
+        "coco -y -p",
+        "agent -p -f",
+        "claude -p --dangerously-skip-permissions",
+    ):
+        assert snippet in proc.stdout, snippet
+
+
 def test_agent_rejects_combining_scopes(run_cli):
     proc = run_cli(["agent", "--local", "--global"])
 

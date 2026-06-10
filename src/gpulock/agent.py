@@ -90,6 +90,28 @@ def build_agent_output(scope: str) -> str:
     )
 
 
+INSTALL_HELP = """\
+Install the policy by feeding this command's output to a coding agent. Pick the
+line that matches your tool:
+
+  Codex CLI (non-interactive; -p means --profile, not print):
+    codex exec --skip-git-repo-check "$(gpulock agent)"           # ./AGENTS.md
+    codex exec --skip-git-repo-check "$(gpulock agent --global)"  # ~/.codex/AGENTS.md
+
+  Coco / Trae CLI (-y auto-approves the edit):
+    coco -y -p "$(gpulock agent --global)"                        # ~/.trae/AGENTS.md
+
+  Cursor CLI (command is `agent`; -f allows the write; no machine-global file):
+    agent -p -f "$(gpulock agent --local)"                        # ./AGENTS.md
+
+  Claude Code (--dangerously-skip-permissions allows the write):
+    claude -p --dangerously-skip-permissions "$(gpulock agent --global)" </dev/null
+
+--global targets the tool's global AGENTS.md; --local (default) targets
+./AGENTS.md. Re-running updates the existing gpulock block in place.
+"""
+
+
 def cmd_agent(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="gpulock agent",
@@ -97,6 +119,8 @@ def cmd_agent(argv: list[str]) -> int:
             "Print the gpulock agent policy plus instructions for installing it "
             "into an AGENTS.md file."
         ),
+        epilog=INSTALL_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument(
