@@ -1,10 +1,10 @@
 <h1 align="center">gpulock</h1>
 
-<p align="center">
+<div align="center">
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/) [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements) [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#project-status) [![License](https://img.shields.io/badge/license-proprietary-red.svg)](#license)
 
-</p>
+</div>
 
 **Read/write locking and fair queuing for shared NVIDIA GPUs — with a guard that keeps your cards utilized.**
 

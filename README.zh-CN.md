@@ -1,10 +1,10 @@
 <h1 align="center">gpulock</h1>
 
-<p align="center">
+<div align="center">
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/) [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求) [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态) [![License](https://img.shields.io/badge/license-proprietary-red.svg)](#许可证)
 
-</p>
+</div>
 
 **为共享的 NVIDIA GPU 提供读写锁与公平排队——并用守护进程保持显卡利用率。**
 
