@@ -63,8 +63,8 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
 }
-_SEED_IDLE_TIMEOUT = 315360000
-_CONFIG_PRESETS = ("seed",)
+_HANDY_IDLE_TIMEOUT = 315360000
+_CONFIG_PRESETS = ("handy",)
 
 
 def _validate_key(key: str) -> None:
@@ -231,7 +231,7 @@ def _config_unset(args: argparse.Namespace) -> int:
     return 0
 
 
-def _seed_gpu_ids() -> list[int]:
+def _handy_gpu_ids() -> list[int]:
     ids = sorted(set(gpu_indices()))
     if not ids:
         raise ValueError("no GPUs found via nvidia-smi")
@@ -242,13 +242,13 @@ def _seed_gpu_ids() -> list[int]:
 
 def _config_preset(args: argparse.Namespace) -> int:
     cfg = _load_cfg()
-    if args.name == "seed":
+    if args.name == "handy":
         try:
-            cfg.gpu_ids = _seed_gpu_ids()
+            cfg.gpu_ids = _handy_gpu_ids()
         except ValueError as e:
             warn(f"cannot apply preset {args.name!r}: {e}")
             return 2
-        cfg.idle_timeout = _SEED_IDLE_TIMEOUT
+        cfg.idle_timeout = _HANDY_IDLE_TIMEOUT
     else:
         warn(f"unknown preset {args.name!r}; presets: {', '.join(_CONFIG_PRESETS)}")
         return 2

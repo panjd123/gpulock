@@ -1,59 +1,197 @@
-# gpulock
+<h1 align="center">gpulock</h1>
+
+<p align="center">
+
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/) [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求) [![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态) [![License](https://img.shields.io/badge/license-proprietary-red.svg)](#许可证)
+
+</p>
+
+**为共享的 NVIDIA GPU 提供读写锁与公平排队——并用守护进程保持显卡利用率。**
+
+```bash
+gpulock check 0 -- python tests/test_kernel.py    # 共享读锁 → 正确性任务
+gpulock perf  0 -- python benchmarks/run.py       # 独占写锁 → 性能任务
+```
+
+[快速上手](#快速上手) · [命令](#命令参考) · [AI Agent](#配合-ai-agent-使用) · [守护服务](#守护服务) · [工作原理](#工作原理)
 
 [English](README.md) | **简体中文**
 
-> 为 NVIDIA GPU 负载提供读写锁与排队能力，并在 GPU 空闲时预留其显存与利用率；
-> 一旦有任务取锁，该预留会被自动释放。
+为多 agent GPU 编程场景设计, 通过这个工具你可以:
 
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#环境要求)
-[![Status](https://img.shields.io/badge/status-beta-orange.svg)](#项目状态)
+- 启动任意多个 agent 并行编程并使用同一组 GPU, agent 会用 `gpulock` 为命令包上一把读写锁，从而避免互相干扰.
+- 自由使用所有 GPU, 同时保持显卡利用率: `gpulock` 提供了一个守护服务, 平时用占位程序申请显存并保持显卡利用率, 当有 `gpulock` 包装器请求时自动让出显卡, 结束后自动恢复.
 
-`gpulock` 专为同时运行大量 GPU 任务的主机而设计——例如多个任务、或多个 coding agent 共享同一组显卡。由于每一次 GPU 访问都通过读写锁被串行化，并发任务会在 GPU 上轮流执行，而不会相互干扰。项目随包附带一份现成的 prompt（[`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md)）；运行 `gpulock agent` 即可打印它，并附带把它写入 agent `AGENTS.md` 的说明，agent 据此即可正确地使用本工具。
+---
 
-`gpulock` 的核心，是在命令运行期间为其包上一把读写锁。正确性类工作在读锁下共享 GPU（`check` / `read`），对性能敏感的工作则在写锁下独占 GPU（`perf` / `write`）。请求按**先到先服务**处理，因此源源不断的读者不会饿死正在等待的写者。这套加锁与排队是完全自包含的：它就是 `gpulock <mode> -- <cmd>` 的全部工作，无需任何后台服务即可运行。
+## 快速上手
 
-另有一个独立、可选的**守护服务**，用于解决另一个问题：在任务之间闲置的 GPU 常会被周边集群回收、调度走或降频，因此当一张卡本应闲置时，守护进程会用一个轻量的占位程序占住它——持有显存并维持利用率。
+```bash
+# 1. 安装
+git clone https://github.com/panjd123/gpulock.git /opt/tiger/gpulock
+pip install -e /opt/tiger/gpulock
+# uv tool install -e /opt/tiger/gpulock --torch-backend auto
+
+# 2. 用守护服务占用空闲 GPU，防止被集群回收
+gpulock service install --no-start
+
+# 默认监控所有可见 GPU, 也可以指定具体哪些 GPU
+# gpulock service config set gpu_ids=0,1
+
+# 默认连续 90 分钟没有 gpulock 活动, 关闭对应 GPU 上的 service, 注意没有经过 gpulock 的 GPU 任务不算
+# gpulock service config set idle_timeout=5400
+
+# 推荐预设:
+# 1. 在卡数大于 1 时, 不监控 GPU0, 否则监控所有 GPU, 保持 GPU0 空闲, 方便不包装 gpulock 的任务也能跑
+# 2. idle_timeout=10年
+gpulock service config preset handy
+
+gpulock service restart
+
+# 3. 让任意 GPU 命令都经过 gpulock 运行
+# 如果对应卡上有 service 的 placeholder, 会自动让他释放
+gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
+gpulock perf 0,1 -- python benchmarks/run.py         # 独占写锁    （性能）
+
+# 4.（可选）配置 AI Agent: 你可以用以下方式让 AI 帮你安装 prompt 到 AGENTS.md
+gpulock agent --help
+agent -p -f "$(gpulock agent --local)"
+```
+
+在被包装的命令内部，`gpulock` 会注入以下环境变量：
+
+```text
+CUDA_VISIBLE_DEVICES=<gpu_ids>
+GPULOCK_LOCKED_DEVICES=<gpu_ids>
+GPULOCK_LOCK_MODE=read|write
+```
+
+相关 agent 配置详见[配合 AI Agent 使用](#配合-ai-agent-使用)。
+
+## 特性
+
+- **读写锁**——读者（`check`）共享 GPU；写者（`perf`）独占 GPU。
+- **公平 FIFO 排队**——先到先服务；读者绝不会饿死正在等待的写者。
+- **多卡加锁不会死锁**——始终按编号升序获取，失败即回滚。
+- **崩溃安全**——心跳加上保守的陈旧锁清理，确保只要真实任务还在卡上，锁就不会丢失。
+- **`perf` 空闲预检查**——在 benchmark 前等待 GPU 真正空闲，即便面对绕过 `gpulock` 的任务。
+- **可选的空闲守护**——预留空闲 GPU 以防被集群回收，并在真实任务到来时立即让出。
+- **零代码改动**——无需改动应用代码、容器镜像或任务框架。
+- **Agent 友好**——附带一份开箱即用的策略（`gpulock agent`），让 coding agent 正确地包装 GPU 命令。
 
 > **加锁与守护进程彼此独立。** 无论守护进程是否在运行，读写锁与排队都照常工作。二者只在一个方向上联动：当某条 `gpulock` 命令取锁时，该卡上守护进程的占位程序会被自动暂停——且仅在持锁期间暂停——使命令在一张干净的卡上运行；待 GPU 重新空闲后，占位程序再恢复。
 
-包装本身是透明的：`gpulock` 取锁、维持心跳、原样运行命令，并在退出时还锁。无需改动应用代码、容器镜像或任务框架。
+## 环境要求
+
+- **Linux**，配备 NVIDIA GPU，且 `PATH` 中可用 `nvidia-smi`。
+- **Python 3.9+**。
+- **PyTorch**，由 placeholder worker 使用，作为普通依赖安装。
+- **supervisor**，自动安装，由守护服务使用。
+
+## 命令参考
+
+```bash
+gpulock check <gpu_ids> -- <cmd>     # 读锁  —— 共享；适合正确性验证
+gpulock read  <gpu_ids> -- <cmd>     # check 的别名
+gpulock perf  <gpu_ids> -- <cmd>     # 写锁  —— 独占；适合性能测试 / profiling
+gpulock write <gpu_ids> -- <cmd>     # perf 的别名
+```
+
+- `<gpu_ids>` 可以是单个编号（`0`），也可以是逗号分隔的列表（`0,1,2`）。编号会被排序并去重。
+- 对于多张 GPU，锁按编号升序依次获取；若任意一张获取失败，本次调用中已取得的锁会被回滚释放。
+
+每次运行的可选参数（完整列表见 `gpulock <mode> --help`）：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--no-wait-gpu-idle` | 关闭 | 仅 `perf`：跳过 GPU 空闲预检查，立即获取写锁（更快；仅当所有 GPU 任务都使用 `gpulock` 时安全） |
+| `--idle-streak-s` | 3 | `perf` 空闲预检查所需的连续 `util=0` 次数 |
+| `--idle-check-ms` | 100 | `perf` 空闲预检查的轮询间隔 |
+| `--poll-ms` | 200 | 取锁轮询间隔 |
+| `--timeout-s` | 1800 | 等待锁的最长时间 |
+| `--grace-age-s` | 180 | 陈旧锁保护期 |
+| `--heartbeat-s` | 2 | 心跳间隔 |
+
+## 配合 AI Agent 使用
+
+当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) 的内容加入 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
+
+该 prompt 已打包进项目内部，因此你无需自己去找这个文件，直接运行 `gpulock agent` 即可打印：
+
+```bash
+gpulock agent            # 打印 prompt，并附带写入 ./AGENTS.md 的说明（默认）
+gpulock agent --local    # 同上：目标为当前目录的 AGENTS.md
+gpulock agent --global   # 目标为当前 coding agent 工具的全局 AGENTS.md
+```
+
+`gpulock agent` 会先打印一段简短的前言，再打印用 `<!-- gpulock:start -->` / `<!-- gpulock:end -->` 标记包裹的 prompt 正文。前言会告诉 agent 应写入哪个 `AGENTS.md`（`--local` 为当前目录，`--global` 为该工具的全局文件，例如 `~/.codex/AGENTS.md` 或 `~/.trae/AGENTS.md`），以及如何就地创建或更新该文件而不重复写入。
+
+### 一条命令完成安装
+
+它的输出本就是为了直接喂给 coding agent CLI，由后者替你完成写入。按你所用的工具选择对应命令：
+
+```bash
+# Codex CLI —— 非交互模式；审批/沙箱取自 ~/.codex/config.toml
+codex exec --skip-git-repo-check "$(gpulock agent)"           # ./AGENTS.md（当前项目）
+codex exec --skip-git-repo-check "$(gpulock agent --global)"  # ~/.codex/AGENTS.md（所有项目）
+
+# Coco / Trae CLI —— -y 自动批准文件写入
+coco -y -p "$(gpulock agent --global)"                        # ~/.trae/AGENTS.md（所有项目）
+
+# Cursor CLI —— 命令名为 `agent`；-f 允许写入（无机器级全局文件）
+agent -p -f "$(gpulock agent --local)"                        # ./AGENTS.md（当前项目）
+
+# Claude Code —— --dangerously-skip-permissions 允许写入
+claude -p --dangerously-skip-permissions "$(gpulock agent --global)" </dev/null  # ~/.claude/CLAUDE.md
+```
+
+用 `--global` 在每台机器上配置一次即可覆盖所有项目；用 `--local`（默认）则只作用于当前项目。该命令是幂等的：重复运行只会更新已有的 `gpulock` 区块，而不会追加重复内容。
+
+各工具注意事项：
+
+- **Codex：** `codex exec` 为非交互模式；`codex` 的 `-p` 表示 `--profile`，并非 print。`--skip-git-repo-check` 允许在非受信 git 仓库外运行；若 stdin 被管道占用，请追加 `</dev/null`。若想自己审阅改动，可改用交互形式：`codex "$(gpulock agent)"`。
+- **Cursor：** 其命令名为 `agent`。它没有机器级全局指令文件，因此请用 `--local` 按项目安装，或在 Cursor 设置里添加为 User Rule。
+- `-y` / `-f` / `--dangerously-skip-permissions` 用于让 agent 无需交互审批即可应用改动；若你希望逐步确认，可去掉它们。
+
+## 守护服务
+
+守护进程是可选的，且与加锁相互独立：无论是否安装它，`gpulock` 的读写锁行为都不变。运行时，它将空闲 GPU 预留下来、使其不被回收，并在真实任务开始时立即让出。它由 `supervisord` 托管。
+
+```bash
+gpulock service install [--gpu-ids 0,1] [--idle-timeout 5400] \
+                        [--placeholder-idle-s 1.0] \
+                        [--no-start] [--env KEY=VALUE ...]
+
+gpulock service start | stop | restart | status | uninstall
+gpulock service logs [-n N] [-f]
+
+gpulock service config show | path | edit
+gpulock service config get <key>
+gpulock service config set <key=value> [...]
+gpulock service config unset <key>
+gpulock service config preset handy   # 持久预留；空出一张卡
+```
+
+**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有非 `gpulock` 的计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有 `gpulock` 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后只有 `gpulock` 活动才会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
+
+**什么算作"活动"。** `idle_timeout` / dormant 计时器**仅由 `gpulock` 驱动**——即持有 `gpulock` 锁，或发起一次 `gpulock` 运行。不经过 `gpulock` 的 GPU 任务**不会**重置该计时器，也**不会**唤醒休眠的 GPU；它在运行期间只会阻止 placeholder 被（重新）激活。
+
+**状态文件**位于 `${lock_root}/service/`：
+
+```text
+config.json        # 由 gpulock 维护
+supervisord.conf   # start/restart 时根据 config.json 重新生成 —— 请勿手动编辑
+supervisord.pid
+supervisord.log
+supervisor.sock
+guard.log
+```
+
+用 `config set` 或 `config edit` 调整 `gpu_ids`、`idle_timeout` 或 `placeholder_idle_s`，然后执行 `gpulock service restart` 使更改生效。
 
 ---
 
-## 目录
-
-- [为什么需要 gpulock](#为什么需要-gpulock)
-- [工作原理](#工作原理)
-- [环境要求](#环境要求)
-- [安装](#安装)
-- [快速上手](#快速上手)
-- [命令参考](#命令参考)
-- [锁语义](#锁语义)
-- [Shell 语义](#shell-语义)
-- [守护服务](#守护服务)
-- [配置](#配置)
-- [退出码](#退出码)
-- [配合 AI Agent 使用](#配合-ai-agent-使用)
-- [项目结构](#项目结构)
-- [开发](#开发)
-- [迁移](#迁移)
-- [项目状态](#项目状态)
-- [许可证](#许可证)
-
----
-
-## 为什么需要 gpulock
-
-在被多个任务共享的主机上，有两类问题反复出现：
-
-1. **隐性争抢。** 当两个负载运行在同一设备上时，正确性通常不受影响，但 benchmark 噪声增大、吞吐下降，且原因不明显。
-2. **空闲回收。** 在任务之间闲置的 GPU，可能被周边集群回收、调度走或降频。
-
-`gpulock` 同时解决这两点：
-
-- **读写锁模型**让正确性与校验类运行共享一张 GPU（`check` / `read`），同时让对性能敏感的运行获得独占访问（`perf` / `write`）。请求按先到先服务处理，写者不会被源源不断的读者饿死。
-- **守护服务**用 placeholder 负载将空闲 GPU 预留下来，并在某个 `gpulock` 任务——或任意外部进程——开始使用该设备时立即让出。
+以下章节为参考资料——精确的语义、内部实现与可调参数。日常使用一般无需关注。
 
 ## 工作原理
 
@@ -85,104 +223,6 @@
 - **心跳**每隔数秒重写一次锁文件。只有当下列条件全部满足时，锁才会被判定为陈旧（stale）并移除：持有者 PID 已退出或缺失、超过保护期、该 GPU 上不再有计算进程，且其心跳与 mtime 在连续两次观察中保持不变。因此，若包装进程退出但其工作负载仍在 GPU 上运行，锁不会丢失。
 - **取锁时**会先 park（或终止）该 GPU 上的守护 placeholder；对 `perf` 模式，则在取锁前执行一次 GPU 空闲预检查。
 
-## 环境要求
-
-- **Linux**，配备 NVIDIA GPU，且 `PATH` 中可用 `nvidia-smi`。
-- **Python 3.9+**。
-- **PyTorch**，由 placeholder worker 使用，作为普通依赖安装。
-- **supervisor**，自动安装，由守护服务使用。
-
-## 安装
-
-使用 `uv`：
-
-```bash
-uv tool install -e . --force --reinstall --refresh --torch-backend auto
-```
-
-使用 `pip`：
-
-```bash
-pip install -e .
-```
-
-`torch` 被声明为普通且不固定版本的依赖；`--torch-backend auto` 让 `uv`
-为当前机器选择合适的 PyTorch wheel。使用 `pip` 时，请确认它安装的 PyTorch
-wheel 适配当前 CUDA / driver 环境，或先自行安装并管理 PyTorch。
-
-安装守护服务但不立即启动：
-
-```bash
-gpulock service install --no-start
-gpulock service config set gpu_ids=0,1
-gpulock service start
-```
-
-`service install --no-start` 只写入配置，不会启动任何进程。
-
-## 快速上手
-
-安装 `gpulock`，按需启动守护服务，然后让 GPU 命令都经过它运行：
-
-```bash
-# 1. 安装
-uv tool install -e . --force --reinstall --refresh --torch-backend auto
-# 或：
-pip install -e .
-
-# 2.（可选）用守护服务预留空闲 GPU。
-gpulock service install
-gpulock service status
-
-# 3. 让任意 GPU 命令都经过 gpulock 运行
-gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
-gpulock perf  0 -- python benchmarks/run.py         # 独占写锁    （性能）
-```
-
-第 2 步是可选的，用于配置那个独立的守护服务。`idle_timeout` 指在**没有任何 `gpulock` 活动**多少秒之后守护进程会释放该 GPU，从而避免一台被遗忘的主机被永久占用；其默认值为 `5400`（90 分钟）。只有 `gpulock` 活动会重置该计时器；绕过 `gpulock` 的 GPU 任务不会（详见[守护服务](#守护服务)）。
-
-再看几种常见写法：
-
-```bash
-# 一次锁定多张 GPU；命令运行前会先取得所有锁
-gpulock write 0,1 -- python train_multi_gpu.py
-
-# perf 默认会等待 GPU 空闲；当所有任务都已经过 gpulock 时可跳过该检查（取锁更快）
-gpulock perf 1 --no-wait-gpu-idle -- ./build/operator_perf
-```
-
-在被包装的命令内部，`gpulock` 会注入以下环境变量：
-
-```text
-CUDA_VISIBLE_DEVICES=<gpu_ids>
-GPULOCK_LOCKED_DEVICES=<gpu_ids>
-GPULOCK_LOCK_MODE=read|write
-```
-
-## 命令参考
-
-```bash
-gpulock check <gpu_ids> -- <cmd>     # 读锁  —— 共享；适合正确性验证
-gpulock read  <gpu_ids> -- <cmd>     # check 的别名
-gpulock perf  <gpu_ids> -- <cmd>     # 写锁  —— 独占；适合性能测试 / profiling
-gpulock write <gpu_ids> -- <cmd>     # perf 的别名
-```
-
-- `<gpu_ids>` 可以是单个编号（`0`），也可以是逗号分隔的列表（`0,1,2`）。编号会被排序并去重。
-- 对于多张 GPU，锁按编号升序依次获取；若任意一张获取失败，本次调用中已取得的锁会被回滚释放。
-
-每次运行的可选参数（完整列表见 `gpulock <mode> --help`）：
-
-| 参数 | 默认值 | 含义 |
-|---|---:|---|
-| `--no-wait-gpu-idle` | 关闭 | 仅 `perf`：跳过 GPU 空闲预检查，立即获取写锁（更快；仅当所有 GPU 任务都使用 `gpulock` 时安全） |
-| `--idle-streak-s` | 3 | `perf` 空闲预检查所需的连续 `util=0` 次数 |
-| `--idle-check-ms` | 100 | `perf` 空闲预检查的轮询间隔 |
-| `--poll-ms` | 200 | 取锁轮询间隔 |
-| `--timeout-s` | 1800 | 等待锁的最长时间 |
-| `--grace-age-s` | 180 | 陈旧锁保护期 |
-| `--heartbeat-s` | 2 | 心跳间隔 |
-
 ## 锁语义
 
 - **`check` / `read`** 获取*读锁*。同一张 GPU 上可同时有多个读者持锁。
@@ -196,7 +236,6 @@ gpulock write <gpu_ids> -- <cmd>     # perf 的别名
   - 若存在其他计算进程但 `util = 0`，则 GPU 仍视为**空闲**。
 
   `perf` 会等待，直到 GPU 报告连续 `--idle-streak-s` 次 `util=0`（每 `--idle-check-ms` 轮询一次），最长不超过锁超时。显存占用会记录到日志中，但本身不会被判定为繁忙。加上 `--no-wait-gpu-idle` 可跳过该预检查、立即取锁：这样更快，但仅当所有 GPU 任务都经过 `gpulock` 时才安全——因为那时锁本身就已经保证了独占访问。
-
 - **陈旧锁清理**有意设计得保守。只有当*以下全部*成立时锁才会被移除：PID 已死或缺失、已过保护期、GPU 上不再有计算进程，且其心跳与 mtime 在两次观察中保持稳定。若包装进程的父进程退出、但其子工作负载仍在 GPU 上运行，则锁会被保留。
 
 ## Shell 语义
@@ -228,41 +267,6 @@ gpulock read 0 -- 'python test.py > out.log'
 ```
 
 被包装的命令通过 `/bin/bash -c` 运行，因此引用形式内部可使用标准 shell 特性。
-
-## 守护服务
-
-守护进程是可选的，且与加锁相互独立：无论是否安装它，`gpulock` 的读写锁行为都不变。运行时，它将空闲 GPU 预留下来、使其不被回收，并在真实任务开始时立即让出。它由 `supervisord` 托管。
-
-```bash
-gpulock service install [--gpu-ids 0,1] [--idle-timeout 5400] \
-                        [--placeholder-idle-s 1.0] \
-                        [--no-start] [--env KEY=VALUE ...]
-
-gpulock service start | stop | restart | status | uninstall
-gpulock service logs [-n N] [-f]
-
-gpulock service config show | path | edit
-gpulock service config get <key>
-gpulock service config set <key=value> [...]
-gpulock service config unset <key>
-```
-
-**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有非 `gpulock` 的计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有 `gpulock` 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后只有 `gpulock` 活动才会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
-
-**什么算作"活动"。** `idle_timeout` / dormant 计时器**仅由 `gpulock` 驱动**——即持有 `gpulock` 锁，或发起一次 `gpulock` 运行。不经过 `gpulock` 的 GPU 任务**不会**重置该计时器，也**不会**唤醒休眠的 GPU；它在运行期间只会阻止 placeholder 被（重新）激活。
-
-**状态文件**位于 `${lock_root}/service/`：
-
-```text
-config.json        # 由 gpulock 维护
-supervisord.conf   # start/restart 时根据 config.json 重新生成 —— 请勿手动编辑
-supervisord.pid
-supervisord.log
-supervisor.sock
-guard.log
-```
-
-用 `config set` 或 `config edit` 调整 `gpu_ids`、`idle_timeout` 或 `placeholder_idle_s`，然后执行 `gpulock service restart` 使更改生效。
 
 ## 配置
 
@@ -313,47 +317,6 @@ GPULOCK_LOCK_DIR  →  /var/lock/gpulock  →  /tmp/gpulock_locks
 | 4 | `service status`：未安装 |
 | 124 | 等待锁超时 |
 | 其他 | 被包装命令的退出码，或 gpulock 内部错误 |
-
-## 配合 AI Agent 使用
-
-当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) 的内容加入 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
-
-该 prompt 已打包进项目内部，因此你无需自己去找这个文件，直接运行 `gpulock agent` 即可打印：
-
-```bash
-gpulock agent            # 打印 prompt，并附带写入 ./AGENTS.md 的说明（默认）
-gpulock agent --local    # 同上：目标为当前目录的 AGENTS.md
-gpulock agent --global   # 目标为当前 coding agent 工具的全局 AGENTS.md
-```
-
-`gpulock agent` 会先打印一段简短的前言，再打印用 `<!-- gpulock:start -->` / `<!-- gpulock:end -->` 标记包裹的 prompt 正文。前言会告诉 agent 应写入哪个 `AGENTS.md`（`--local` 为当前目录，`--global` 为该工具的全局文件，例如 `~/.codex/AGENTS.md` 或 `~/.trae/AGENTS.md`），以及如何就地创建或更新该文件而不重复写入。
-
-### 一条命令完成安装
-
-它的输出本就是为了直接喂给 coding agent CLI，由后者替你完成写入。按你所用的工具选择对应命令：
-
-```bash
-# Codex CLI —— 非交互模式；审批/沙箱取自 ~/.codex/config.toml
-codex exec --skip-git-repo-check "$(gpulock agent)"           # ./AGENTS.md（当前项目）
-codex exec --skip-git-repo-check "$(gpulock agent --global)"  # ~/.codex/AGENTS.md（所有项目）
-
-# Coco / Trae CLI —— -y 自动批准文件写入
-coco -y -p "$(gpulock agent --global)"                        # ~/.trae/AGENTS.md（所有项目）
-
-# Cursor CLI —— 命令名为 `agent`；-f 允许写入（无机器级全局文件）
-agent -p -f "$(gpulock agent --local)"                        # ./AGENTS.md（当前项目）
-
-# Claude Code —— --dangerously-skip-permissions 允许写入
-claude -p --dangerously-skip-permissions "$(gpulock agent --global)" </dev/null  # ~/.claude/CLAUDE.md
-```
-
-用 `--global` 在每台机器上配置一次即可覆盖所有项目；用 `--local`（默认）则只作用于当前 checkout。该命令是幂等的：重复运行只会更新已有的 `gpulock` 区块，而不会追加重复内容。
-
-各工具注意事项：
-
-- **Codex：** `codex exec` 为非交互模式；`codex` 的 `-p` 表示 `--profile`，并非 print。`--skip-git-repo-check` 允许在非受信 git 仓库外运行；若 stdin 被管道占用，请追加 `</dev/null`。若想自己审阅改动，可改用交互形式：`codex "$(gpulock agent)"`。
-- **Cursor：** 其命令名为 `agent`。它没有机器级全局指令文件，因此请用 `--local` 按项目安装，或在 Cursor 设置里添加为 User Rule。
-- `-y` / `-f` / `--dangerously-skip-permissions` 用于让 agent 无需交互审批即可应用改动；若你希望逐步确认，可去掉它们。
 
 ## 项目结构
 

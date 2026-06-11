@@ -156,7 +156,7 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert not (service_dir / "supervisord.conf").exists()
 
 
-def test_service_config_preset_seed_selects_guarded_gpus(run_cli, lock_root, cli_env, tmp_path):
+def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cli_env, tmp_path):
     nvidia_smi = tmp_path / "nvidia-smi"
     nvidia_smi.write_text(
         "#!/bin/sh\n"
@@ -170,9 +170,9 @@ def test_service_config_preset_seed_selects_guarded_gpus(run_cli, lock_root, cli
     proc = run_cli(["service", "install", "--no-start"])
     assert proc.returncode == 0, proc.stderr
 
-    proc = run_cli(["service", "config", "preset", "seed"])
+    proc = run_cli(["service", "config", "preset", "handy"])
     assert proc.returncode == 0, proc.stderr
-    assert "applied preset seed" in proc.stdout
+    assert "applied preset handy" in proc.stdout
     assert "service restart" in proc.stdout
 
     saved_cfg = json.loads((service_dir / "config.json").read_text())
@@ -180,7 +180,7 @@ def test_service_config_preset_seed_selects_guarded_gpus(run_cli, lock_root, cli
     assert saved_cfg["idle_timeout"] == 315360000
 
 
-def test_service_config_preset_seed_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
+def test_service_config_preset_handy_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
     nvidia_smi = tmp_path / "nvidia-smi"
     nvidia_smi.write_text(
         "#!/bin/sh\n"
@@ -194,7 +194,7 @@ def test_service_config_preset_seed_uses_single_gpu(run_cli, lock_root, cli_env,
     proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "9"])
     assert proc.returncode == 0, proc.stderr
 
-    proc = run_cli(["service", "config", "preset", "seed"])
+    proc = run_cli(["service", "config", "preset", "handy"])
     assert proc.returncode == 0, proc.stderr
 
     saved_cfg = json.loads((service_dir / "config.json").read_text())
@@ -202,7 +202,7 @@ def test_service_config_preset_seed_uses_single_gpu(run_cli, lock_root, cli_env,
     assert saved_cfg["idle_timeout"] == 315360000
 
 
-def test_service_config_preset_seed_fails_without_detected_gpus(
+def test_service_config_preset_handy_fails_without_detected_gpus(
     run_cli,
     lock_root,
     cli_env,
@@ -221,7 +221,7 @@ def test_service_config_preset_seed_fails_without_detected_gpus(
     proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "4"])
     assert proc.returncode == 0, proc.stderr
 
-    proc = run_cli(["service", "config", "preset", "seed"])
+    proc = run_cli(["service", "config", "preset", "handy"])
     assert proc.returncode == 2
     assert "no GPUs found" in proc.stderr
 
