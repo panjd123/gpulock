@@ -11,6 +11,11 @@ import sys
 from .config import LockConfig, READ_MODE, WRITE_MODE
 from .config import env_int as _env_int
 from .agent import cmd_agent
+from .diagnostics import (
+    build_abnormal_exit_report,
+    record_session_release_tombstones,
+    should_emit_abnormal_exit_report,
+)
 from .guard import cmd_guard
 from .logging_setup import setup_main_logger
 from .paths import resolve_lock_root
@@ -180,6 +185,7 @@ def _run_locked_command(args: argparse.Namespace) -> int:
     child_env = os.environ.copy()
     child_env.update(session.child_env_overrides())
 
+    rc = 0
     try:
         rc = subprocess.run(
             command,
@@ -194,6 +200,15 @@ def _run_locked_command(args: argparse.Namespace) -> int:
         log.exception("cmd run child failed gpus=%s mode=%s err=%s", gpu_ids_str, mode, e)
         rc = 1
     finally:
+        if should_emit_abnormal_exit_report(rc):
+            report = build_abnormal_exit_report(
+                gpu_ids,
+                mode=mode,
+                returncode=rc,
+            )
+            print(report, file=sys.stderr, flush=True)
+            log.warning("cmd run abnormal exit report gpus=%s mode=%s rc=%d\n%s", gpu_ids_str, mode, rc, report.rstrip())
+        record_session_release_tombstones(session.locks, rc)
         session.release()
         print(f"[GPU Lock] released mode={mode} devices={gpu_ids_str}", flush=True)
     log.info("cmd run finished gpus=%s mode=%s rc=%d", gpu_ids_str, mode, rc)

@@ -21,6 +21,10 @@ Use `gpulock perf` when measuring performance or when the command needs a clean,
 
 Conceptually, `check` and `perf` behave like read/write locks: multiple `check` runs may coexist, while `perf` is exclusive and blocks both `check` and other `perf` runs.
 
+**Memory scheduling (human-owned, not inferred):** assign GPUs up front. On each GPU, plan for at most **one memory-heavy job** plus any number of light jobs. `check`/`read` does **not** isolate GPU memory — two large jobs can both pass the lock and still CUDA OOM. Use `perf`/`write` for large workloads, or put large jobs on different GPUs.
+
+If a wrapped command exits abnormally, `gpulock` prints a **GPU contention report** on stderr (peer locks, per-process GPU memory, card usage). Use it as a diagnostic hint only; do not treat it as permission to ignore the scheduling rule above.
+
 `<gpu_ids>` may be a single GPU such as `0`, or a comma-separated list such as `0,1,2`.
 
 ## Environment Boundary
