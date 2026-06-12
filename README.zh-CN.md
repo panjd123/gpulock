@@ -33,7 +33,7 @@ pip install -e /opt/tiger/gpulock
 # uv tool install -e /opt/tiger/gpulock --torch-backend auto
 
 # 2. 用守护服务占用空闲 GPU，防止被集群回收
-gpulock service install --no-start
+gpulock service install
 
 # 默认监控所有可见 GPU, 也可以指定具体哪些 GPU
 # gpulock service config set gpu_ids=0,1

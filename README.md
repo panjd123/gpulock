@@ -33,7 +33,7 @@ pip install -e /opt/tiger/gpulock
 # uv tool install -e /opt/tiger/gpulock --torch-backend auto
 
 # 2. Reserve idle GPUs with the guard service so the cluster doesn't reclaim them
-gpulock service install --no-start
+gpulock service install
 
 # Watches every visible GPU by default; or name specific ones
 # gpulock service config set gpu_ids=0,1
