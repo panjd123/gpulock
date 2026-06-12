@@ -38,8 +38,8 @@ gpulock service install
 # Watches every visible GPU by default; or name specific ones
 # gpulock service config set gpu_ids=0,1
 
-# By default a GPU's service shuts down after 90 minutes with no gpulock activity
-# (GPU work that doesn't go through gpulock doesn't count)
+# By default a GPU becomes dormant after 90 minutes with no user GPU activity
+# (counts both gpulock usage and same-UID non-placeholder compute)
 # gpulock service config set idle_timeout=5400
 
 # Recommended preset:
@@ -174,9 +174,9 @@ gpulock service config unset <key>
 gpulock service config preset handy   # persistent reservation; leaves one card free
 ```
 
-**Lifecycle.** While a GPU is idle, the guard activates a placeholder that allocates approximately 85% of device memory and runs a small CUDAGraph GEMM loop to sustain utilization. It yields to real work in two ways: when it detects a `gpulock` lock or activity pulse on the GPU it **parks** the placeholder, releasing the compute load so the job runs without interference; and it will not (re)activate a placeholder while a non-`gpulock` compute process is using the GPU. After `idle_timeout` seconds with no `gpulock` activity, the placeholder becomes **dormant** and releases both memory and compute; only subsequent `gpulock` activity reactivates it. The placeholder appears in `nvidia-smi` under the process title `tensorrt_engine_cache`.
+**Lifecycle.** While a GPU is idle, the guard activates a placeholder that allocates approximately 85% of device memory and runs a small CUDAGraph GEMM loop to sustain utilization. It yields to real work in two ways: when it detects a `gpulock` lock or activity pulse on the GPU it **parks** the placeholder, releasing the compute load so the job runs without interference; and it will not (re)activate a placeholder while a non-placeholder compute process owned by the guard's user is using the GPU. After `idle_timeout` seconds with no recent user GPU activity, the placeholder becomes **dormant** and releases both memory and compute; subsequent `gpulock` activity or user-owned GPU compute reactivates it. The placeholder appears in `nvidia-smi` under the process title `tensorrt_engine_cache`.
 
-**What counts as activity.** The `idle_timeout` / dormant timer is driven solely by `gpulock` — a held `gpulock` lock, or a starting `gpulock` run. GPU work that does not go through `gpulock` does **not** reset this timer and does **not** wake a dormant GPU; while such work runs it only prevents the placeholder from being (re)activated.
+**What counts as activity.** The guard appends events to a single `gpu_activity` table (`activity_type` = `gpulock` or `user_gpu`). The latest timestamp per GPU and type is fetched via an index on `(gpu_id, activity_type, ts DESC)`; rows are never deleted. **Last gpulock activity** covers a held lock or a starting `gpulock` run; **last user GPU activity** covers non-placeholder compute owned by the guard's UID. The `idle_timeout` / dormant timer resets when **either** is recent. `gpulock service status` shows both ages.
 
 **State files** reside in `${lock_root}/service/`:
 
@@ -189,7 +189,7 @@ supervisor.sock
 guard.log
 ```
 
-Adjust `gpu_ids`, `idle_timeout`, or `placeholder_idle_s` with `config set` or `config edit`, then run `gpulock service restart` to apply the changes.
+Adjust `gpu_ids`, `idle_timeout`, `placeholder_idle_s`, or `guard_poll_s` with `config set` or `config edit`, then run `gpulock service restart` to apply the changes.
 
 ---
 
@@ -217,7 +217,7 @@ The sections below are reference material — the precise semantics, internals, 
    │  guard service (supervisord)                                       │
    │  watches each GPU; when idle, activates a placeholder that holds   │
    │  memory + a CUDAGraph compute loop; parks it on any gpulock        │
-   │  activity; goes dormant after a long idle period.                  │
+   │  activity; goes dormant after idle_timeout without user GPU work.  │
    └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -277,8 +277,9 @@ The wrapped command runs through `/bin/bash -c`, so standard shell features are 
 | Key | Default | Meaning |
 |---|---:|---|
 | `gpu_ids` | empty | GPUs the guard monitors; an empty value enumerates all visible GPUs at startup |
-| `idle_timeout` | 5400 (90 min) | Seconds without `gpulock` activity before a GPU becomes dormant and its active placeholder is released. Only `gpulock` activity counts; non-`gpulock` GPU work does not reset it. |
+| `idle_timeout` | 5400 (90 min) | Seconds without user GPU activity before a GPU becomes dormant and its active placeholder is released. Counts both `gpulock` activity and non-placeholder compute owned by the guard's UID. |
 | `placeholder_idle_s` | 1.0 | Seconds a GPU must remain free of locks and activity before the placeholder is (re)activated. The default is set comfortably above the interval between consecutive `gpulock` runs, so a placeholder is not inserted between the steps of a script. |
+| `guard_poll_s` | 0.2 | How often the guard polls locks, activity pulses, and `nvidia-smi` for user-owned GPU compute. |
 
 `extra_env`, `python_executable`, and `gpulock_executable` are also stored in `config.json` and are normally written by `service install`. To change `extra_env`, use `gpulock service config edit`.
 

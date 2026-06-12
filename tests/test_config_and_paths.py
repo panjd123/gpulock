@@ -67,11 +67,12 @@ def test_notify_guard_activity_persists_last_and_history(lock_root):
     conn = sqlite3.connect(str(guard_db))
     try:
         last_row = conn.execute(
-            "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
+            "SELECT ts FROM gpu_activity WHERE gpu_id=? AND activity_type='gpulock' "
+            "ORDER BY ts DESC LIMIT 1",
             (99,),
         ).fetchone()
         hist_row = conn.execute(
-            "SELECT COUNT(*) FROM gpu_activity WHERE gpu_id=? AND active=1",
+            "SELECT COUNT(*) FROM gpu_activity WHERE gpu_id=? AND activity_type='gpulock'",
             (99,),
         ).fetchone()
     finally:

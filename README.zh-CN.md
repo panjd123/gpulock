@@ -38,7 +38,7 @@ gpulock service install
 # 默认监控所有可见 GPU, 也可以指定具体哪些 GPU
 # gpulock service config set gpu_ids=0,1
 
-# 默认连续 90 分钟没有 gpulock 活动, 关闭对应 GPU 上的 service, 注意没有经过 gpulock 的 GPU 任务不算
+# 默认连续 90 分钟没有用户 GPU 活动则进入 dormant（计入 gpulock 与同 UID 非 placeholder 计算）
 # gpulock service config set idle_timeout=5400
 
 # 推荐预设:
@@ -172,9 +172,9 @@ gpulock service config unset <key>
 gpulock service config preset handy   # 持久预留；空出一张卡
 ```
 
-**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有非 `gpulock` 的计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有 `gpulock` 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后只有 `gpulock` 活动才会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
+**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有属于 guard 同 UID 的非 placeholder 计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有用户 GPU 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后 `gpulock` 活动或本用户的 GPU 计算会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
 
-**什么算作"活动"。** `idle_timeout` / dormant 计时器**仅由 `gpulock` 驱动**——即持有 `gpulock` 锁，或发起一次 `gpulock` 运行。不经过 `gpulock` 的 GPU 任务**不会**重置该计时器，也**不会**唤醒休眠的 GPU；它在运行期间只会阻止 placeholder 被（重新）激活。
+**什么算作"活动"。** guard 向单张 `gpu_activity` 表追加事件（`activity_type` 为 `gpulock` 或 `user_gpu`），通过 `(gpu_id, activity_type, ts DESC)` 索引快速取最近一条，**从不删除**历史行。**最近一次 gpulock 活动**指持有锁或发起 `gpulock` 运行；**最近一次本用户 GPU 活动**指 guard 同 UID 的非 placeholder 计算进程。`idle_timeout` / dormant 在**任一**活动仍处窗口内时不触发。`gpulock service status` 分别显示两个时间。
 
 **状态文件**位于 `${lock_root}/service/`：
 
@@ -187,7 +187,7 @@ supervisor.sock
 guard.log
 ```
 
-用 `config set` 或 `config edit` 调整 `gpu_ids`、`idle_timeout` 或 `placeholder_idle_s`，然后执行 `gpulock service restart` 使更改生效。
+用 `config set` 或 `config edit` 调整 `gpu_ids`、`idle_timeout`、`placeholder_idle_s` 或 `guard_poll_s`，然后执行 `gpulock service restart` 使更改生效。
 
 ---
 
@@ -275,7 +275,8 @@ gpulock read 0 -- 'python test.py > out.log'
 | 键 | 默认值 | 含义 |
 |---|---:|---|
 | `gpu_ids` | 空 | 守护进程监控的 GPU；空值表示在启动时枚举所有可见 GPU |
-| `idle_timeout` | 5400（90 分钟） | 无 `gpulock` 活动超过多少秒后，GPU 进入 dormant 并释放其正在激活的 placeholder。只有 `gpulock` 活动会计入；不经过 `gpulock` 的 GPU 任务不会重置它。 |
+| `idle_timeout` | 5400（90 分钟） | 无用户 GPU 活动超过多少秒后，GPU 进入 dormant 并释放其正在激活的 placeholder。同时计入 `gpulock` 活动与 guard 同 UID 的非 placeholder 计算。 |
+| `guard_poll_s` | 0.2 | guard 轮询锁、活动脉冲和 `nvidia-smi` 上本用户 GPU 计算的间隔（秒）。 |
 | `placeholder_idle_s` | 1.0 | GPU 在无锁且无活动后需保持多少秒才会（重新）激活 placeholder。默认值明显高于连续 `gpulock` 运行之间的间隔，因此 placeholder 不会被插入到脚本的两步之间。 |
 
 `extra_env`、`python_executable`、`gpulock_executable` 同样保存在 `config.json` 中，通常由 `service install` 写入。若要修改 `extra_env`，请使用 `gpulock service config edit`。

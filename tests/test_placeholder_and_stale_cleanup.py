@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import logging
 import sqlite3
@@ -11,7 +12,8 @@ from pathlib import Path
 from gpulock import config, gpu, guard, lock, placeholder
 from gpulock.guard import _init_guard_db
 from gpulock.config import GpuRuntimeState
-from gpulock.service.common import DEFAULT_PLACEHOLDER_IDLE_S
+from gpulock.service import supervisor
+from gpulock.service.common import DEFAULT_PLACEHOLDER_IDLE_S, guard_status_path
 
 
 def _write_stale_writer(lock_obj: lock.GpuLock, pid: int = 99999999) -> None:
@@ -233,6 +235,95 @@ def _wait_until(deadline_s: float, predicate):
     return last
 
 
+def _guard_test_env(lock_root: Path, fake_modules: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["GPULOCK_LOCK_DIR"] = str(lock_root)
+    env["PYTHONPATH"] = f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}"
+    return env
+
+
+def _start_guard_proc(
+    env: dict[str, str],
+    gpu_id: int,
+    *,
+    idle_timeout_s: float,
+    placeholder_idle_s: float = 0.05,
+    guard_poll_s: float = 0.1,
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gpulock",
+            "guard",
+            str(gpu_id),
+            "--placeholder-idle-s",
+            str(placeholder_idle_s),
+            "--idle-timeout",
+            str(idle_timeout_s),
+            "--guard-poll-s",
+            str(guard_poll_s),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _write_fake_nvidia_smi(bin_dir: Path, gpu_id: int) -> None:
+    script = bin_dir / "nvidia-smi"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'GPU_ID="{gpu_id}"\n'
+        'UUID="GPU-TEST-UUID-${GPU_ID}"\n'
+        'case "$*" in\n'
+        '  *query-compute-apps=gpu_uuid,pid*)\n'
+        '    PID_FILE="${GPULOCK_LOCK_DIR}/gpu${GPU_ID}/test_compute.pid"\n'
+        '    if [ -f "${PID_FILE}" ]; then\n'
+        '      COMPUTE_PID="$(cat "${PID_FILE}")"\n'
+        '      if kill -0 "${COMPUTE_PID}" 2>/dev/null; then\n'
+        '        echo "${UUID},${COMPUTE_PID}"\n'
+        "      fi\n"
+        "    fi\n"
+        "    ;;\n"
+        '  *query-gpu=index,uuid*)\n'
+        '    echo "${GPU_ID},${UUID}"\n'
+        "    ;;\n"
+        '  *query-gpu=index,utilization.gpu,memory.used,memory.total*)\n'
+        '    echo "${GPU_ID},0,1000,80000"\n'
+        "    ;;\n"
+        '  *query-gpu=index*)\n'
+        '    echo "${GPU_ID}"\n'
+        "    ;;\n"
+        "  *)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+
+def _gpu_guard_status(lock_root: Path, gpu_id: int) -> dict | None:
+    status_path = guard_status_path(lock_root)
+    if not status_path.exists():
+        return None
+    data = json.loads(status_path.read_text(encoding="utf-8"))
+    for item in data.get("gpus", []):
+        if item.get("gpu_id") == gpu_id:
+            return item
+    return None
+
+
+def _assert_guard_alive(guard_proc: subprocess.Popen[str]) -> None:
+    if guard_proc.poll() is not None:
+        stdout, stderr = guard_proc.communicate(timeout=1)
+        raise AssertionError(
+            f"guard exited early rc={guard_proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+        )
+
+
 def _stop_process(proc: subprocess.Popen[str]) -> None:
     proc.terminate()
     try:
@@ -409,7 +500,7 @@ def _activity_timestamps(lock_root: Path, gpu_id: int) -> list[float]:
         return [
             float(row[0])
             for row in conn.execute(
-                "SELECT ts FROM gpu_activity WHERE gpu_id=? ORDER BY ts",
+                "SELECT ts FROM gpu_activity WHERE gpu_id=? AND activity_type='gpulock' ORDER BY ts",
                 (gpu_id,),
             )
         ]
@@ -551,4 +642,152 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
         )
         assert reactivated_state is True
     finally:
+        _stop_process(guard_proc)
+
+
+def test_idle_timeout_enters_dormant_reflected_in_status_and_reactivates_on_gpulock(
+    lock_root,
+    tmp_path,
+    capsys,
+):
+    idle_timeout_s = 1
+    gpu_id = 99
+    fake_modules = tmp_path / "fake-modules"
+    _write_fake_placeholder_deps(fake_modules)
+    env = _guard_test_env(lock_root, fake_modules)
+    guard_proc = _start_guard_proc(env, gpu_id, idle_timeout_s=idle_timeout_s)
+    gpu_dir = lock_root / f"gpu{gpu_id}"
+
+    try:
+        initial_state = _wait_until(
+            time.monotonic() + 10.0,
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
+        )
+        _assert_guard_alive(guard_proc)
+        assert initial_state is True
+
+        dormant_snap = _wait_until(
+            time.monotonic() + idle_timeout_s + 5.0,
+            lambda: snap
+            if (snap := _gpu_guard_status(lock_root, gpu_id)) is not None and snap.get("dormant") is True
+            else None,
+        )
+        _assert_guard_alive(guard_proc)
+        assert dormant_snap is not None
+        assert dormant_snap["placeholder"] == "parked"
+        assert dormant_snap["last_gpulock_activity_age_s"] >= idle_timeout_s
+        assert "dormant" in str(dormant_snap["reason"])
+
+        status_data = json.loads(guard_status_path(lock_root).read_text(encoding="utf-8"))
+        assert status_data["idle_timeout"] == idle_timeout_s
+        assert status_data["guard_poll_s"] == 0.1
+
+        supervisor._print_guard_snapshot()
+        captured = capsys.readouterr()
+        assert f"gpu{gpu_id}: placeholder=parked" in captured.out
+        assert "last_gpulock_activity=" in captured.out
+        assert "last_user_gpu_activity=" in captured.out
+        assert "dormant" in captured.out
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "gpulock",
+                "read",
+                str(gpu_id),
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        reactivated_state = _wait_until(
+            time.monotonic() + 5.0,
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
+        )
+        _assert_guard_alive(guard_proc)
+        assert reactivated_state is True
+
+        awake_snap = _wait_until(
+            time.monotonic() + 5.0,
+            lambda: snap
+            if (snap := _gpu_guard_status(lock_root, gpu_id)) is not None
+            and snap.get("dormant") is False
+            and snap.get("placeholder") == "active"
+            and snap.get("last_gpulock_activity_age_s", idle_timeout_s) < idle_timeout_s
+            else None,
+        )
+        assert awake_snap is not None
+        assert "dormant" not in str(awake_snap["reason"])
+    finally:
+        _stop_process(guard_proc)
+
+
+def test_user_gpu_activity_prevents_dormant_and_is_recorded_in_status(lock_root, tmp_path, capsys):
+    idle_timeout_s = 1
+    gpu_id = 99
+    fake_modules = tmp_path / "fake-modules"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_placeholder_deps(fake_modules)
+    _write_fake_nvidia_smi(fake_bin, gpu_id)
+
+    env = _guard_test_env(lock_root, fake_modules)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    guard_proc = _start_guard_proc(env, gpu_id, idle_timeout_s=idle_timeout_s, guard_poll_s=0.1)
+    gpu_dir = lock_root / f"gpu{gpu_id}"
+    compute_proc: subprocess.Popen[bytes] | None = None
+    try:
+        initial_state = _wait_until(
+            time.monotonic() + 10.0,
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
+        )
+        _assert_guard_alive(guard_proc)
+        assert initial_state is True
+
+        compute_proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        gpu_dir.mkdir(parents=True, exist_ok=True)
+        (gpu_dir / "test_compute.pid").write_text(str(compute_proc.pid), encoding="utf-8")
+
+        time.sleep(idle_timeout_s + 0.5)
+        snap = _gpu_guard_status(lock_root, gpu_id)
+        _assert_guard_alive(guard_proc)
+        assert snap is not None
+        assert snap.get("dormant") is False
+        assert snap.get("last_user_gpu_activity_age_s", 999) < idle_timeout_s
+        assert compute_proc.pid in snap.get("user_gpu_compute_pids", [])
+
+        supervisor._print_guard_snapshot()
+        captured = capsys.readouterr()
+        assert "last_user_gpu_activity=" in captured.out
+
+        (gpu_dir / "test_compute.pid").unlink(missing_ok=True)
+        compute_proc.terminate()
+        compute_proc.wait(timeout=10)
+
+        dormant_snap = _wait_until(
+            time.monotonic() + idle_timeout_s + 5.0,
+            lambda: snap
+            if (snap := _gpu_guard_status(lock_root, gpu_id)) is not None and snap.get("dormant") is True
+            else None,
+        )
+        _assert_guard_alive(guard_proc)
+        assert dormant_snap is not None
+    finally:
+        (gpu_dir / "test_compute.pid").unlink(missing_ok=True)
+        if compute_proc is not None and compute_proc.poll() is None:
+            compute_proc.kill()
+            compute_proc.wait(timeout=10)
         _stop_process(guard_proc)

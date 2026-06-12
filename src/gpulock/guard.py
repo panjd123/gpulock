@@ -13,7 +13,22 @@ import sys
 import time
 from pathlib import Path
 
-from .gpu import gpu_compute_pids, gpu_indices, gpu_runtime_state_by_index, kill_visible_placeholder_compute_pids
+from .activity import (
+    init_guard_db,
+    last_gpulock_activity_age_s,
+    last_user_gpu_activity_age_s,
+    has_recent_user_idle_activity,
+    record_gpulock_activity,
+    record_gpulock_event,
+    record_user_gpu_activity,
+)
+from .gpu import (
+    gpu_compute_pids,
+    gpu_indices,
+    gpu_runtime_state_by_index,
+    kill_visible_placeholder_compute_pids,
+    user_gpu_compute_pids,
+)
 from .lock import gpu_has_our_activity
 from .logging_setup import setup_guard_logger
 from .paths import read_lock_metadata, resolve_lock_root
@@ -26,72 +41,33 @@ from .placeholder import (
     placeholder_state,
     stop_placeholder,
 )
-from .service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
-from .service.common import guard_status_path
+from .service.common import (
+    DEFAULT_GUARD_POLL_S,
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_PLACEHOLDER_IDLE_S,
+    guard_status_path,
+)
 
 
 PLACEHOLDER_START_TIMEOUT_S = 60.0
 PLACEHOLDER_START_FAILURE_EXIT_THRESHOLD = 3
 
 
-def _init_guard_db(lock_root: Path) -> sqlite3.Connection:
+def _open_guard_db(lock_root: Path) -> sqlite3.Connection:
     db_path = lock_root / "guard.db"
     conn = sqlite3.connect(str(db_path))
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS gpu_activity (ts REAL NOT NULL, gpu_id INTEGER NOT NULL, active INTEGER NOT NULL)"
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_gpu_ts ON gpu_activity(gpu_id, ts)")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS gpu_last_activity (gpu_id INTEGER PRIMARY KEY, last_activity_ts REAL NOT NULL)"
-    )
+    init_guard_db(conn)
     conn.commit()
     return conn
 
 
-def _touch_last_activity(conn: sqlite3.Connection, gpu_id: int, ts: float) -> None:
-    conn.execute(
-        "INSERT INTO gpu_last_activity(gpu_id, last_activity_ts) VALUES (?, ?) "
-        "ON CONFLICT(gpu_id) DO UPDATE SET last_activity_ts=excluded.last_activity_ts",
-        (gpu_id, ts),
-    )
-
-
-def _record_activity_event(conn: sqlite3.Connection, gpu_id: int, ts: float) -> None:
-    conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (ts, gpu_id, 1))
-    _touch_last_activity(conn, gpu_id, ts)
-
-
-def _has_recent_activity(
-    conn: sqlite3.Connection,
-    gpu_id: int,
-    window_s: float = DEFAULT_IDLE_TIMEOUT,
-) -> bool:
-    row = conn.execute(
-        "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
-        (gpu_id,),
-    ).fetchone()
-    if row is None:
-        return False
-    try:
-        last_ts = float(row[0])
-    except (TypeError, ValueError):
-        return False
-    return (time.time() - last_ts) <= max(window_s, 0.0)
-
-
-def _prune_activity_history(conn: sqlite3.Connection, now_ts: float, retention_s: float = 86400.0) -> int:
-    cutoff = now_ts - max(retention_s, 0.0)
-    cur = conn.execute("DELETE FROM gpu_activity WHERE ts<?", (cutoff,))
-    return int(cur.rowcount or 0)
+# Backward-compatible alias for tests and callers.
+_init_guard_db = _open_guard_db
 
 
 def _has_recent_pulse(last_pulse_ts: dict[int, float], gpu_id: int, window_s: float) -> bool:
     ts = last_pulse_ts.get(gpu_id, 0.0)
     return ts > 0.0 and (time.time() - ts) <= max(window_s, 0.0)
-
-
-def _guard_poll_interval_s(placeholder_idle_s: float) -> float:
-    return min(max(float(placeholder_idle_s) / 2.0, 0.05), 0.5)
 
 
 def _resolve_guard_gpu_ids(requested_gpu_ids: list[int]) -> list[int]:
@@ -115,19 +91,6 @@ def _write_guard_status(lock_root: Path, snapshot: dict[str, object]) -> None:
         os.replace(tmp_path, path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
-
-
-def _last_activity_age_s(conn: sqlite3.Connection, gpu_id: int, now: float) -> float | None:
-    row = conn.execute(
-        "SELECT last_activity_ts FROM gpu_last_activity WHERE gpu_id=?",
-        (gpu_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        return max(now - float(row[0]), 0.0)
-    except (TypeError, ValueError):
-        return None
 
 
 def _external_compute_pids(visible_pids: set[int], known_placeholder_pids: set[int]) -> set[int]:
@@ -173,7 +136,12 @@ def cmd_guard(argv: list[str]) -> int:
         "--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S,
         help=f"seconds of GPU idleness before spawning placeholder (default {DEFAULT_PLACEHOLDER_IDLE_S})",
     )
+    parser.add_argument(
+        "--guard-poll-s", type=float, default=DEFAULT_GUARD_POLL_S,
+        help=f"guard main-loop poll interval in seconds (default {DEFAULT_GUARD_POLL_S})",
+    )
     args = parser.parse_args(argv)
+    args.guard_poll_s = max(float(args.guard_poll_s), 0.05)
     args.gpu_ids = _resolve_guard_gpu_ids(args.gpu_ids)
     if not args.gpu_ids:
         print("[gpulock] could not enumerate visible GPUs for guard; pass GPU_ID explicitly", file=sys.stderr)
@@ -181,7 +149,8 @@ def cmd_guard(argv: list[str]) -> int:
 
     lock_root = resolve_lock_root()
     log = setup_guard_logger(lock_root)
-    conn = _init_guard_db(lock_root)
+    conn = _open_guard_db(lock_root)
+    guard_uid = os.getuid()
 
     placeholders: dict[int, subprocess.Popen] = {}
     placeholder_fail_reported: set[int] = set()
@@ -193,8 +162,6 @@ def cmd_guard(argv: list[str]) -> int:
     idle_since: dict[int, float] = {}
     dormant: set[int] = set()
     last_pulse_ts: dict[int, float] = {}
-    last_history_prune_ts = 0.0
-
     def ingest_activity_pulse(gid: int) -> None:
         pulse_path = lock_root / f"gpu{gid}" / "activity.pulse"
         if not pulse_path.exists():
@@ -213,12 +180,28 @@ def cmd_guard(argv: list[str]) -> int:
         mode = meta.get("mode", "unknown")
         pid = meta.get("pid", "?")
         cmd = meta.get("cmdline", "").strip() or "<unknown>"
-        _record_activity_event(conn, gid, time.time())
+        record_gpulock_event(conn, gid, time.time())
         idle_since.pop(gid, None)
         if gid in dormant:
             dormant.discard(gid)
             log.info("gpu%d: woke from dormant (gpulock activity)", gid)
         log.info("gpu%d: gpulock activity mode=%s pid=%s cmd=%s", gid, mode, pid, cmd)
+
+    def observe_user_gpu_activity(gid: int, now: float) -> set[int]:
+        known_placeholder_pids = placeholder_compute_pids_by_gpu.get(gid, set())
+        user_pids = user_gpu_compute_pids(
+            gid,
+            uid=guard_uid,
+            exclude_pids=known_placeholder_pids,
+        )
+        if not user_pids:
+            return user_pids
+        record_user_gpu_activity(conn, gid, now)
+        idle_since.pop(gid, None)
+        if gid in dormant:
+            dormant.discard(gid)
+            log.info("gpu%d: woke from dormant (user GPU activity pids=%s)", gid, sorted(user_pids))
+        return user_pids
 
     def ensure_placeholder_worker(gid: int) -> bool:
         nonlocal consecutive_placeholder_start_failures, should_exit_for_placeholder_failures
@@ -344,18 +327,29 @@ def cmd_guard(argv: list[str]) -> int:
         our_active = gpu_has_our_activity(lock_root, gid)
         recent_pulse = _has_recent_pulse(last_pulse_ts, gid, max(args.placeholder_idle_s, 0.0))
         rt = gpu_runtime_state_by_index(gid)
-        last_activity_age = _last_activity_age_s(conn, gid, now)
+        last_gpulock_activity_age = last_gpulock_activity_age_s(conn, gid, now)
+        last_user_gpu_activity_age = last_user_gpu_activity_age_s(conn, gid, now)
         external_compute_pids = external_gpu_compute_pids(gid)
+        user_gpu_pids = user_gpu_compute_pids(
+            gid,
+            uid=guard_uid,
+            exclude_pids=placeholder_compute_pids_by_gpu.get(gid, set()),
+        )
 
         reason = "placeholder active"
         if not ph_alive and gid in placeholder_fail_reported:
             reason = "placeholder worker failed to start; see guard log"
         elif gid in dormant:
-            reason = f"dormant: no gpulock activity for {args.idle_timeout}s"
+            reason = f"dormant: no user GPU activity for {args.idle_timeout}s"
         elif our_active:
             reason = "parked: gpulock lock or queue activity detected"
         elif rt is None:
             reason = "waiting: GPU runtime state unavailable from nvidia-smi"
+        elif user_gpu_pids:
+            reason = (
+                "waiting: user-owned non-placeholder GPU process detected "
+                f"(pids={sorted(user_gpu_pids)})"
+            )
         elif external_compute_pids:
             reason = (
                 "waiting: non-placeholder GPU process detected "
@@ -391,7 +385,9 @@ def cmd_guard(argv: list[str]) -> int:
             "our_activity": our_active,
             "recent_pulse": recent_pulse,
             "idle_for_s": max(now - idle_since[gid], 0.0) if gid in idle_since else None,
-            "last_activity_age_s": last_activity_age,
+            "last_gpulock_activity_age_s": last_gpulock_activity_age,
+            "last_user_gpu_activity_age_s": last_user_gpu_activity_age,
+            "user_gpu_compute_pids": sorted(user_gpu_pids),
             "runtime": runtime,
             "reason": reason,
         }
@@ -408,6 +404,7 @@ def cmd_guard(argv: list[str]) -> int:
                 "gpu_ids": args.gpu_ids,
                 "idle_timeout": args.idle_timeout,
                 "placeholder_idle_s": args.placeholder_idle_s,
+                "guard_poll_s": args.guard_poll_s,
                 "gpus": [gpu_status_snapshot(gid) for gid in args.gpu_ids],
             },
         )
@@ -437,23 +434,22 @@ def cmd_guard(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    # Seed last-activity timestamps so a fresh guard start does not
-    # immediately classify GPUs as dormant before any user job arrives.
+    # Seed activity rows so a fresh guard start does not immediately go dormant.
     startup_ts = time.time()
     for gid in args.gpu_ids:
-        _touch_last_activity(conn, gid, startup_ts)
+        record_gpulock_activity(conn, gid, startup_ts)
+        observe_user_gpu_activity(gid, startup_ts)
         ensure_placeholder_worker(gid)
         if should_exit_for_placeholder_failures:
             cleanup()
             return 70
     conn.commit()
-    _prune_activity_history(conn, startup_ts)
-    conn.commit()
 
     log.info(
-        "watching gpu %s (placeholder_idle_s=%.3f)",
+        "watching gpu %s (placeholder_idle_s=%.3f guard_poll_s=%.3f)",
         args.gpu_ids,
         max(args.placeholder_idle_s, 0.0),
+        args.guard_poll_s,
     )
     for gid in args.gpu_ids:
         if gpu_has_our_activity(lock_root, gid):
@@ -477,6 +473,8 @@ def cmd_guard(argv: list[str]) -> int:
                 pid_file = gpu_dir / "placeholder.pid"
 
                 ingest_activity_pulse(gid)
+                now = time.time()
+                user_gpu_pids = observe_user_gpu_activity(gid, now)
 
                 if gid in placeholders and placeholders[gid].poll() is not None:
                     rc = placeholders[gid].returncode
@@ -524,7 +522,7 @@ def cmd_guard(argv: list[str]) -> int:
                 recent_pulse = _has_recent_pulse(last_pulse_ts, gid, max(args.placeholder_idle_s, 0.0))
 
                 if our_active:
-                    _touch_last_activity(conn, gid, time.time())
+                    record_gpulock_activity(conn, gid, time.time())
                     if ph_alive:
                         park_placeholder_worker(gid, "our process/lock detected")
                     idle_since.pop(gid, None)
@@ -535,18 +533,15 @@ def cmd_guard(argv: list[str]) -> int:
                     if ph_alive and gid in placeholder_active:
                         park_placeholder_worker(gid, "dormant")
                 else:
-                    now = time.time()
                     if gid not in idle_since:
                         idle_since[gid] = now
-                    if recent_pulse:
+                    if recent_pulse or user_gpu_pids:
                         idle_since[gid] = now
                     elif now - idle_since[gid] >= max(args.placeholder_idle_s, 0.0):
                         # Do not reactivate placeholder if non-placeholder processes
                         # are actively using this GPU (e.g. training outlived its
                         # gpulock wrapper).
-                        rt = gpu_runtime_state_by_index(gid)
-                        external_compute_pids = external_gpu_compute_pids(gid)
-                        if external_compute_pids:
+                        if user_gpu_pids or external_gpu_compute_pids(gid):
                             idle_since[gid] = now  # reset idle timer
                         else:
                             activate_placeholder_worker(gid, "gpu idle")
@@ -555,7 +550,11 @@ def cmd_guard(argv: list[str]) -> int:
                                 return 70
                             if gid in placeholder_active:
                                 idle_since.pop(gid, None)
-                    if ph_alive and gid in placeholder_active and not _has_recent_activity(conn, gid, args.idle_timeout):
+                    if (
+                        ph_alive
+                        and gid in placeholder_active
+                        and not has_recent_user_idle_activity(conn, gid, args.idle_timeout, now=now)
+                    ):
                         park_placeholder_worker(gid, f"no user activity for {args.idle_timeout}s")
                         dormant.add(gid)
                         idle_since.pop(gid, None)
@@ -563,13 +562,6 @@ def cmd_guard(argv: list[str]) -> int:
 
             conn.commit()
             write_status_snapshot()
-            now_ts = time.time()
-            if now_ts - last_history_prune_ts >= 86400.0:
-                deleted = _prune_activity_history(conn, now_ts)
-                conn.commit()
-                last_history_prune_ts = now_ts
-                if deleted > 0:
-                    log.info("pruned %d gpu_activity rows older than 24h", deleted)
-            time.sleep(_guard_poll_interval_s(args.placeholder_idle_s))
+            time.sleep(args.guard_poll_s)
     finally:
         cleanup()

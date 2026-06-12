@@ -389,10 +389,12 @@ def _print_guard_snapshot() -> None:
             if "external_compute_pids" in runtime:
                 runtime_text += f" external_pids={runtime.get('external_compute_pids', [])}"
         idle_for = item.get("idle_for_s")
-        last_activity_age = item.get("last_activity_age_s")
+        last_gpulock_activity_age = item.get("last_gpulock_activity_age_s", item.get("last_activity_age_s"))
+        last_user_gpu_activity_age = item.get("last_user_gpu_activity_age_s")
         timing_text = (
             f" idle_for={_format_optional_seconds(idle_for)}"
-            f" last_gpulock_activity={_format_optional_seconds(last_activity_age)}"
+            f" last_gpulock_activity={_format_optional_seconds(last_gpulock_activity_age)}"
+            f" last_user_gpu_activity={_format_optional_seconds(last_user_gpu_activity_age)}"
         )
         print(
             f"  gpu{gpu_id}: placeholder={placeholder}{pid_text};"
@@ -421,6 +423,7 @@ def status() -> int:
     print(f"guard log:    {guard_log_path()}")
     print(f"gpu_ids:      {cfg.gpu_ids or '<all visible GPUs>'}")
     print(f"idle_timeout: {cfg.idle_timeout}s")
+    print(f"guard_poll_s: {cfg.guard_poll_s}s")
     print(f"supervisord:  {'running (pid=' + str(pid) + ')' if pid else 'stopped'}")
     if pid == 0:
         return 3

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from ..gpu import gpu_indices
 from . import supervisor as supervisor_backend
 from .common import (
+    DEFAULT_GUARD_POLL_S,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PLACEHOLDER_IDLE_S,
     GuardServiceConfig,
@@ -62,6 +63,7 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "gpu_ids": (_parse_gpu_ids, list),
     "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
+    "guard_poll_s": (float, lambda: DEFAULT_GUARD_POLL_S),
 }
 _HANDY_IDLE_TIMEOUT = 315360000
 _CONFIG_PRESETS = ("handy",)
@@ -113,6 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_install.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT)
     p_install.add_argument("--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S)
+    p_install.add_argument("--guard-poll-s", type=float, default=DEFAULT_GUARD_POLL_S)
     p_install.add_argument(
         "--env", action="append", default=[], metavar="KEY=VALUE",
         help="extra environment variable to inject into the guard (repeat to add more)",
@@ -161,6 +164,7 @@ def _do_install(args: argparse.Namespace) -> int:
             gpu_ids=_parse_gpu_ids(args.gpu_ids),
             idle_timeout=int(args.idle_timeout),
             placeholder_idle_s=float(args.placeholder_idle_s),
+            guard_poll_s=float(args.guard_poll_s),
             extra_env=_parse_env_kv(list(args.env)),
             python_executable=sys.executable or "",
             gpulock_executable=shutil.which("gpulock") or "",

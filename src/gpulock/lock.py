@@ -57,25 +57,16 @@ def notify_guard_activity(lock_root: Path, gpu_id: int, mode: str) -> None:
     except Exception:
         tmp_path.unlink(missing_ok=True)
 
-    # Persist one activity pulse to DB so short-lived jobs are not missed.
+    # Append a gpulock activity row so short-lived jobs are not missed.
     import sqlite3
+
+    from .activity import init_guard_db, record_gpulock_event
 
     db_path = lock_root / "guard.db"
     try:
         conn = sqlite3.connect(str(db_path), timeout=1.0)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gpu_activity (ts REAL NOT NULL, gpu_id INTEGER NOT NULL, active INTEGER NOT NULL)"
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_gpu_ts ON gpu_activity(gpu_id, ts)")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gpu_last_activity (gpu_id INTEGER PRIMARY KEY, last_activity_ts REAL NOT NULL)"
-        )
-        conn.execute("INSERT INTO gpu_activity VALUES (?,?,?)", (now, gpu_id, 1))
-        conn.execute(
-            "INSERT INTO gpu_last_activity(gpu_id, last_activity_ts) VALUES (?, ?) "
-            "ON CONFLICT(gpu_id) DO UPDATE SET last_activity_ts=excluded.last_activity_ts",
-            (gpu_id, now),
-        )
+        init_guard_db(conn)
+        record_gpulock_event(conn, gpu_id, now)
         conn.commit()
         conn.close()
     except Exception:

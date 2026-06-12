@@ -88,6 +88,15 @@ def gpu_has_processes_by_index(index: int) -> bool:
     return False
 
 
+def process_owner_uid(pid: int) -> int | None:
+    if pid <= 0:
+        return None
+    try:
+        return os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+
+
 def gpu_compute_pids(index: int) -> set[int]:
     target_uuid = gpu_uuid_by_index(index)
     if target_uuid is None:
@@ -107,6 +116,25 @@ def gpu_compute_pids(index: int) -> set[int]:
         except ValueError:
             continue
         if pid > 0:
+            pids.add(pid)
+    return pids
+
+
+def user_gpu_compute_pids(
+    index: int,
+    *,
+    uid: int | None = None,
+    exclude_pids: set[int] | None = None,
+) -> set[int]:
+    """Non-placeholder compute PIDs on ``index`` owned by ``uid`` (default: current user)."""
+    owner_uid = os.getuid() if uid is None else uid
+    excluded = exclude_pids or set()
+    pids: set[int] = set()
+    for pid in gpu_compute_pids(index):
+        if pid in excluded or is_placeholder_process(pid):
+            continue
+        pid_uid = process_owner_uid(pid)
+        if pid_uid == owner_uid:
             pids.add(pid)
     return pids
 

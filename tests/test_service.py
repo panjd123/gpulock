@@ -8,7 +8,11 @@ import pytest
 
 from gpulock.guard import _external_compute_pids
 from gpulock.service import common, supervisor
-from gpulock.service.common import DEFAULT_IDLE_TIMEOUT, DEFAULT_PLACEHOLDER_IDLE_S
+from gpulock.service.common import (
+    DEFAULT_GUARD_POLL_S,
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_PLACEHOLDER_IDLE_S,
+)
 
 
 def test_guard_service_config_round_trip(lock_root):
@@ -16,6 +20,7 @@ def test_guard_service_config_round_trip(lock_root):
         gpu_ids=[0, 2, 5],
         idle_timeout=900,
         placeholder_idle_s=1.5,
+        guard_poll_s=0.25,
         extra_env={"FOO": "bar", "K": "v=eq"},
         python_executable="/usr/bin/python3",
         gpulock_executable="/opt/gpulock/bin/gpulock",
@@ -34,6 +39,8 @@ def test_guard_service_config_round_trip(lock_root):
         "900",
         "--placeholder-idle-s",
         "1.5",
+        "--guard-poll-s",
+        "0.25",
     ]
 
 
@@ -88,6 +95,7 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert saved_cfg["gpu_ids"] == [0, 1]
     assert saved_cfg["idle_timeout"] == 600
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
+    assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert "placeholder_load" not in saved_cfg
     assert saved_cfg["extra_env"]["FOO"] == "bar"
 
@@ -149,6 +157,13 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert proc.returncode == 0
     saved_cfg4 = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg4["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
+
+    proc = run_cli(["service", "config", "set", "guard_poll_s=0.3"])
+    assert proc.returncode == 0
+    proc = run_cli(["service", "config", "unset", "guard_poll_s"])
+    assert proc.returncode == 0
+    saved_cfg5 = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg5["guard_poll_s"] == DEFAULT_GUARD_POLL_S
 
     proc = run_cli(["service", "uninstall"])
     assert proc.returncode == 0, proc.stderr
@@ -246,6 +261,7 @@ def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
                 "gpu_ids": [0],
                 "idle_timeout": 600,
                 "placeholder_idle_s": 1.0,
+                "guard_poll_s": 0.2,
                 "gpus": [
                     {
                         "gpu_id": 0,
@@ -255,7 +271,9 @@ def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
                         "our_activity": False,
                         "recent_pulse": False,
                         "idle_for_s": 0.4,
-                        "last_activity_age_s": 42.0,
+                        "last_gpulock_activity_age_s": 42.0,
+                        "last_user_gpu_activity_age_s": 120.0,
+                        "user_gpu_compute_pids": [4242],
                         "runtime": {
                             "util_gpu": 0,
                             "mem_used_mib": 100,
@@ -282,6 +300,8 @@ def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
     assert "program:      gpulock-guard RUNNING" in captured.out
     assert "guard status: updated" in captured.out
     assert "gpu0: placeholder=parked pid=12345" in captured.out
+    assert "last_gpulock_activity=42.0s" in captured.out
+    assert "last_user_gpu_activity=120.0s" in captured.out
     assert "non_placeholder_pids=1" in captured.out
     assert "reason=waiting: non-placeholder GPU process detected" in captured.out
 
