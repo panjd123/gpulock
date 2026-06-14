@@ -13,8 +13,9 @@ from ..paths import resolve_lock_root
 
 _PREFIX = "[gpulock service]"
 DEFAULT_IDLE_TIMEOUT = 5400
-DEFAULT_PLACEHOLDER_IDLE_S = 1.0
-DEFAULT_GUARD_POLL_S = 0.2
+DEFAULT_PLACEHOLDER_IDLE_S = 0.2
+DEFAULT_GUARD_POLL_S = 0.05
+DEFAULT_PLACEHOLDER_MEM_RATIO = 0.85
 GUARD_STATUS_FILENAME = "guard.status.json"
 
 
@@ -62,6 +63,7 @@ class GuardServiceConfig:
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT
     placeholder_idle_s: float = DEFAULT_PLACEHOLDER_IDLE_S
     guard_poll_s: float = DEFAULT_GUARD_POLL_S
+    placeholder_mem_ratio: float = DEFAULT_PLACEHOLDER_MEM_RATIO
     extra_env: dict[str, str] = field(default_factory=dict)
     python_executable: str = ""
     gpulock_executable: str = ""
@@ -73,6 +75,7 @@ class GuardServiceConfig:
             "--idle-timeout", str(self.idle_timeout),
             "--placeholder-idle-s", str(self.placeholder_idle_s),
             "--guard-poll-s", str(self.guard_poll_s),
+            "--placeholder-mem-ratio", str(self.placeholder_mem_ratio),
         ]
 
     def save(self, lock_root: Path | None = None) -> Path:
@@ -95,6 +98,7 @@ class GuardServiceConfig:
             idle_timeout=int(data.get("idle_timeout", DEFAULT_IDLE_TIMEOUT)),
             placeholder_idle_s=float(data.get("placeholder_idle_s", DEFAULT_PLACEHOLDER_IDLE_S)),
             guard_poll_s=float(data.get("guard_poll_s", DEFAULT_GUARD_POLL_S)),
+            placeholder_mem_ratio=float(data.get("placeholder_mem_ratio", DEFAULT_PLACEHOLDER_MEM_RATIO)),
             extra_env={str(k): str(v) for k, v in dict(data.get("extra_env", {})).items()},
             python_executable=str(data.get("python_executable", "")),
             gpulock_executable=str(data.get("gpulock_executable", "")),

@@ -201,7 +201,7 @@ def build_placeholder_graph(torch, load_a, load_b, load_c):
 # Placeholder process entry point
 # ---------------------------------------------------------------------------
 
-def placeholder_main(gpu_id: int) -> int:
+def placeholder_main(gpu_id: int, mem_ratio: float = 0.85) -> int:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     import setproctitle  # type: ignore
@@ -224,7 +224,8 @@ def placeholder_main(gpu_id: int) -> int:
         if total is None:
             _, total = torch.cuda.mem_get_info()
         total = int(total)
-        count = int(total * 0.85) // 4
+        count = int(total * max(0.0, min(1.0, mem_ratio))) // 4
+        compute_only = mem_ratio <= 0.0
     except Exception as e:
         print(f"[gpulock] placeholder gpu{gpu_id}: {e}", file=sys.stderr)
         return 1
@@ -266,10 +267,15 @@ def placeholder_main(gpu_id: int) -> int:
             torch.cuda.empty_cache()
 
     def ensure_resources() -> None:
-        if state["buf"] is None:
+        if state["buf"] is None and not compute_only and count > 0:
             state["buf"] = torch.empty(count, dtype=torch.float32, device="cuda:0")
             print(
                 f"[gpulock] placeholder gpu{gpu_id}: allocated {count * 4 / 1e9:.1f}GB",
+                flush=True,
+            )
+        elif compute_only:
+            print(
+                f"[gpulock] placeholder gpu{gpu_id}: compute-only mode (no memory allocation)",
                 flush=True,
             )
         if state["graph"] is not None:
@@ -289,9 +295,10 @@ def placeholder_main(gpu_id: int) -> int:
         state["load_iters"] = load_iters
         state["eager_sample_s"] = eager_sample_s
         state["replay_s"] = replay_s
+        mode_str = "compute-only" if compute_only else f"mem_ratio={mem_ratio:.2f}"
         print(
             f"[gpulock] placeholder gpu{gpu_id}: CUDAGraph replay enabled "
-            f"(dim={load_dim}, iters={load_iters}, eager_sample={eager_sample_s:.6f}s/128, "
+            f"({mode_str}, dim={load_dim}, iters={load_iters}, eager_sample={eager_sample_s:.6f}s/128, "
             f"replay={replay_s:.6f}s, sleep={idle_sleep_s:.3f}s)",
             flush=True,
         )

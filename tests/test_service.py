@@ -12,6 +12,7 @@ from gpulock.service.common import (
     DEFAULT_GUARD_POLL_S,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PLACEHOLDER_IDLE_S,
+    DEFAULT_PLACEHOLDER_MEM_RATIO,
 )
 
 
@@ -41,6 +42,8 @@ def test_guard_service_config_round_trip(lock_root):
         "1.5",
         "--guard-poll-s",
         "0.25",
+        "--placeholder-mem-ratio",
+        str(DEFAULT_PLACEHOLDER_MEM_RATIO),
     ]
 
 
@@ -96,7 +99,9 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert saved_cfg["idle_timeout"] == 600
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
     assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
+    assert saved_cfg["placeholder_mem_ratio"] == DEFAULT_PLACEHOLDER_MEM_RATIO
     assert "placeholder_load" not in saved_cfg
+    assert "placeholder_util_threshold" not in saved_cfg
     assert saved_cfg["extra_env"]["FOO"] == "bar"
 
     conf_on_disk = (service_dir / "supervisord.conf").read_text()
@@ -193,6 +198,7 @@ def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cl
     saved_cfg = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg["gpu_ids"] == [1, 2]
     assert saved_cfg["idle_timeout"] == 315360000
+    assert saved_cfg["placeholder_mem_ratio"] == 0.0
 
 
 def test_service_config_preset_handy_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
@@ -215,6 +221,7 @@ def test_service_config_preset_handy_uses_single_gpu(run_cli, lock_root, cli_env
     saved_cfg = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg["gpu_ids"] == [0]
     assert saved_cfg["idle_timeout"] == 315360000
+    assert saved_cfg["placeholder_mem_ratio"] == 0.0
 
 
 def test_service_config_preset_handy_fails_without_detected_gpus(

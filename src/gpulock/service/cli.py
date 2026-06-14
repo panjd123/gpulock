@@ -15,6 +15,7 @@ from .common import (
     DEFAULT_GUARD_POLL_S,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PLACEHOLDER_IDLE_S,
+    DEFAULT_PLACEHOLDER_MEM_RATIO,
     GuardServiceConfig,
     say,
     warn,
@@ -59,11 +60,19 @@ def _parse_env_kv(items: list[str]) -> dict[str, str]:
 
 # Settable config keys (via `gpulock service config set/get/unset`),
 # mapped to (parser, default-factory).
+def _parse_mem_ratio(raw: str) -> float:
+    value = float(raw)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"placeholder_mem_ratio must be between 0.0 and 1.0, got {value}")
+    return value
+
+
 _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "gpu_ids": (_parse_gpu_ids, list),
     "idle_timeout": (int, lambda: DEFAULT_IDLE_TIMEOUT),
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
     "guard_poll_s": (float, lambda: DEFAULT_GUARD_POLL_S),
+    "placeholder_mem_ratio": (_parse_mem_ratio, lambda: DEFAULT_PLACEHOLDER_MEM_RATIO),
 }
 _HANDY_IDLE_TIMEOUT = 315360000
 _CONFIG_PRESETS = ("handy",)
@@ -116,6 +125,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT)
     p_install.add_argument("--placeholder-idle-s", type=float, default=DEFAULT_PLACEHOLDER_IDLE_S)
     p_install.add_argument("--guard-poll-s", type=float, default=DEFAULT_GUARD_POLL_S)
+    p_install.add_argument("--placeholder-mem-ratio", type=float, default=DEFAULT_PLACEHOLDER_MEM_RATIO,
+                           help="fraction of GPU memory to allocate (0.0-1.0, 0 = compute-only)")
     p_install.add_argument(
         "--env", action="append", default=[], metavar="KEY=VALUE",
         help="extra environment variable to inject into the guard (repeat to add more)",
@@ -165,6 +176,7 @@ def _do_install(args: argparse.Namespace) -> int:
             idle_timeout=int(args.idle_timeout),
             placeholder_idle_s=float(args.placeholder_idle_s),
             guard_poll_s=float(args.guard_poll_s),
+            placeholder_mem_ratio=_parse_mem_ratio(str(args.placeholder_mem_ratio)),
             extra_env=_parse_env_kv(list(args.env)),
             python_executable=sys.executable or "",
             gpulock_executable=shutil.which("gpulock") or "",
@@ -253,6 +265,7 @@ def _config_preset(args: argparse.Namespace) -> int:
             warn(f"cannot apply preset {args.name!r}: {e}")
             return 2
         cfg.idle_timeout = _HANDY_IDLE_TIMEOUT
+        cfg.placeholder_mem_ratio = 0.0
     else:
         warn(f"unknown preset {args.name!r}; presets: {', '.join(_CONFIG_PRESETS)}")
         return 2
@@ -260,7 +273,8 @@ def _config_preset(args: argparse.Namespace) -> int:
     say(
         f"applied preset {args.name}: "
         f"gpu_ids={_format_value('gpu_ids', cfg.gpu_ids)} "
-        f"idle_timeout={cfg.idle_timeout}"
+        f"idle_timeout={cfg.idle_timeout} "
+        f"placeholder_mem_ratio={cfg.placeholder_mem_ratio}"
     )
     say("apply with: gpulock service restart")
     return 0

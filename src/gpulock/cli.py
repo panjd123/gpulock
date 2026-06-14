@@ -74,6 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_run_parser("write", WRITE_MODE, "alias for perf")
     add_run_parser("check", READ_MODE, "run a command with a shared read lock")
     add_run_parser("read", READ_MODE, "alias for check")
+    add_run_parser("serve", WRITE_MODE, "run a long-lived service with exclusive write lock + placeholder coordination")
     return parser
 
 
@@ -216,19 +217,79 @@ def _run_locked_command(args: argparse.Namespace) -> int:
     return int(rc)
 
 
+def _parse_placeholder_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="gpulock _placeholder", add_help=False)
+    parser.add_argument("gpu_id", type=int, help="GPU ID to run placeholder on")
+    parser.add_argument("--mem-ratio", type=float, default=0.85,
+                        help="fraction of GPU memory to allocate (0.0-1.0, 0 = compute-only)")
+    return parser.parse_args(argv)
+
+
+def _get_serve_signal_paths(gpu_ids: list[int]) -> list[Path]:
+    """Return the paths to serve signal files for the given GPU IDs."""
+    from .paths import resolve_lock_root
+    lock_root = resolve_lock_root()
+    return [lock_root / f"gpu{gid}" / "serve.busy" for gid in gpu_ids]
+
+
+def _touch_serve_signal(gpu_ids: list[int]) -> None:
+    """Create serve signal files to indicate active requests."""
+    import time
+    for path in _get_serve_signal_paths(gpu_ids):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(time.time()))
+
+
+def _clear_serve_signal(gpu_ids: list[int]) -> None:
+    """Remove serve signal files to indicate no active requests."""
+    for path in _get_serve_signal_paths(gpu_ids):
+        path.unlink(missing_ok=True)
+
+
+def _run_serve_command(args: argparse.Namespace) -> int:
+    """Run a command in serve mode: write lock + signal file coordination.
+
+    Serve mode holds a write lock on the GPUs (like perf), but also
+    coordinates with the guard via signal files. The wrapped command
+    can touch/clear the signal files to indicate when it's busy.
+    """
+    # Serve mode uses WRITE_MODE (exclusive lock) like perf
+    args.mode = WRITE_MODE
+    return _run_locked_command(args)
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         sub = sys.argv[1]
         if sub == "_placeholder":
-            return placeholder_main(int(sys.argv[2]))
+            args = _parse_placeholder_args(sys.argv[2:])
+            return placeholder_main(args.gpu_id, mem_ratio=args.mem_ratio)
         if sub == "guard":
             return cmd_guard(sys.argv[2:])
         if sub == "service":
             return cmd_service(sys.argv[2:])
         if sub == "agent":
             return cmd_agent(sys.argv[2:])
+        if sub == "_serve_signal":
+            # Internal command: touch or clear serve signal files
+            # Usage: gpulock _serve_signal <gpu_ids> <on|off>
+            if len(sys.argv) < 4:
+                print("Usage: gpulock _serve_signal <gpu_ids> <on|off>", file=sys.stderr)
+                return 2
+            gpu_ids = _parse_gpu_ids(sys.argv[2])
+            action = sys.argv[3]
+            if action == "on":
+                _touch_serve_signal(gpu_ids)
+            elif action == "off":
+                _clear_serve_signal(gpu_ids)
+            else:
+                print(f"Unknown action: {action}", file=sys.stderr)
+                return 2
+            return 0
 
     args = _parse_run_args(sys.argv[1:])
+    if getattr(args, "mode", None) == "serve":
+        return _run_serve_command(args)
     return _run_locked_command(args)
 
 
