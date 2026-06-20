@@ -83,7 +83,7 @@ def gpu_has_processes_by_index(index: int) -> bool:
             pid = int(parts[1])
         except ValueError:
             continue
-        if pid > 0:
+        if pid > 0 and not is_placeholder_process(pid):
             return True
     return False
 
