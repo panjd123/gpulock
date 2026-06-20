@@ -16,13 +16,19 @@ is never patched. The only cost is a local 127.0.0.1 forwarding hop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import socket
 import threading
 import time
 from typing import Callable, Iterable
 
 logger = logging.getLogger("gpulock.serve_proxy")
+
+# Hosts that mean "listen on every interface". For these we bind both IPv4 and
+# IPv6 so clients can reach the proxy over either stack.
+_WILDCARD_HOSTS = frozenset({"", "*", "0.0.0.0", "::"})
 
 # ---------------------------------------------------------------------------
 # Request blacklist (heartbeat / probe / metadata endpoints)
@@ -236,6 +242,27 @@ def _filter_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
 
+def _make_ipv4_first_connector():
+    """Build a TCPConnector whose resolver returns IPv4 addresses first.
+
+    Internal traffic to the backend should prefer IPv4 (vLLM/SGLang bind
+    127.0.0.1 by default), but we still fall back to IPv6 so an IPv6-only or
+    ``[::1]`` backend keeps working. Literal IP backends are unaffected: their
+    single family is returned as-is.
+    """
+    from aiohttp import TCPConnector
+    from aiohttp.resolver import DefaultResolver
+
+    class _IPv4FirstResolver(DefaultResolver):
+        async def resolve(self, host, port=0, family=socket.AF_UNSPEC):
+            # Resolve over both families, then order IPv4 before IPv6.
+            results = await super().resolve(host, port, socket.AF_UNSPEC)
+            results.sort(key=lambda r: 0 if r["family"] == socket.AF_INET else 1)
+            return results
+
+    return TCPConnector(resolver=_IPv4FirstResolver(), family=socket.AF_UNSPEC)
+
+
 def build_proxy_app(
     backend_url: str,
     counter: RequestCounter,
@@ -249,7 +276,12 @@ def build_proxy_app(
 
     async def _on_startup(app: "web.Application") -> None:
         # No total timeout: streaming generations can run for minutes.
-        app["session"] = ClientSession(timeout=ClientTimeout(total=None, sock_connect=30))
+        # Prefer IPv4 when talking to the local backend (internal traffic is
+        # IPv4-first), but keep IPv6 as a fallback.
+        app["session"] = ClientSession(
+            timeout=ClientTimeout(total=None, sock_connect=30),
+            connector=_make_ipv4_first_connector(),
+        )
 
     async def _on_cleanup(app: "web.Application") -> None:
         session = app.get("session")
@@ -315,6 +347,67 @@ async def _wait_backend_ready(backend_url: str, timeout_s: float = 600.0) -> Non
     logger.warning("backend %s not reachable after %.0fs; proxying anyway", backend_url, timeout_s)
 
 
+def _format_host_for_url(host: str) -> str:
+    """Wrap IPv6 literals in brackets so they are valid inside a URL authority."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _make_listen_sockets(listen_host: str, listen_port: int) -> list[socket.socket]:
+    """Create bound listen sockets for ``listen_host``.
+
+    A wildcard host (``0.0.0.0``/``::``/``*``/empty) binds *both* IPv4 and IPv6
+    so clients can connect over either stack. The IPv6 socket is set
+    ``IPV6_V6ONLY`` so the two sockets can share the same port without the
+    "address already in use" clash that a dual-stack IPv6 socket would cause.
+
+    A specific host binds only the family that host resolves to.
+    """
+    socks: list[socket.socket] = []
+    if listen_host in _WILDCARD_HOSTS:
+        specs = [(socket.AF_INET, "0.0.0.0")]
+        if socket.has_ipv6:
+            specs.append((socket.AF_INET6, "::"))
+    else:
+        # Resolve the explicit host to its concrete family/families.
+        infos = socket.getaddrinfo(
+            listen_host, listen_port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        seen: set[tuple[int, str]] = set()
+        specs = []
+        for family, _type, _proto, _canon, sockaddr in infos:
+            key = (family, sockaddr[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append((family, sockaddr[0]))
+
+    for family, addr in specs:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            # Keep IPv4 and IPv6 wildcard sockets independent on the same port.
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            sock.bind((addr, listen_port))
+        except OSError as e:
+            sock.close()
+            # Tolerate a missing family (e.g. IPv6 disabled) when we asked for a
+            # wildcard dual-stack bind, but only if at least one socket survives.
+            if listen_host in _WILDCARD_HOSTS and socks:
+                logger.warning("skip listen on %s:%d: %s", addr, listen_port, e)
+                continue
+            for s in socks:
+                s.close()
+            raise
+        sock.listen(128)
+        sock.setblocking(False)
+        socks.append(sock)
+    return socks
+
+
 async def run_proxy(
     listen_host: str,
     listen_port: int,
@@ -329,15 +422,19 @@ async def run_proxy(
     """Run the reverse proxy until ``stop_event`` is set."""
     from aiohttp import web
 
-    backend_url = f"http://{backend_host}:{backend_port}"
+    backend_url = f"http://{_format_host_for_url(backend_host)}:{backend_port}"
     app = build_proxy_app(backend_url, counter, rules)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, listen_host, listen_port)
-    await site.start()
-    logger.info(
-        "serve proxy listening on %s:%d -> %s", listen_host, listen_port, backend_url
+
+    sockets = _make_listen_sockets(listen_host, listen_port)
+    for sock in sockets:
+        site = web.SockSite(runner, sock)
+        await site.start()
+    bound = ", ".join(
+        f"{s.getsockname()[0]}:{s.getsockname()[1]}" for s in sockets
     )
+    logger.info("serve proxy listening on %s -> %s", bound, backend_url)
     if ready_event is not None:
         ready_event.set()
     try:

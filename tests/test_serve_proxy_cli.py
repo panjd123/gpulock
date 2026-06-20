@@ -35,6 +35,24 @@ def test_parse_proxy_spec_host_combinations():
     assert _parse_proxy_spec("2") is None
 
 
+def test_parse_proxy_spec_ipv6_literals():
+    # IPv6 wildcard listen, IPv4 backend (brackets stripped from the result)
+    assert _parse_proxy_spec("[::]:8000:8001") == ("::", 8000, "127.0.0.1", 8001)
+    # IPv6 on both sides
+    assert _parse_proxy_spec("[::]:8000:[::1]:8001") == ("::", 8000, "::1", 8001)
+    # IPv4 listen, IPv6 backend
+    assert _parse_proxy_spec("0.0.0.0:8000:[::1]:8001") == ("0.0.0.0", 8000, "::1", 8001)
+    # full IPv6 literal address
+    assert _parse_proxy_spec("[2001:db8::1]:8000:8001") == (
+        "2001:db8::1",
+        8000,
+        "127.0.0.1",
+        8001,
+    )
+    # bare (unbracketed) IPv6 is rejected: ambiguous against the separators
+    assert _parse_proxy_spec("::1:8000:8001") is None
+
+
 def test_parse_serve_proxy_args_splits_command_and_options():
     args = _parse_serve_proxy_args(
         ["8000:8001", "2,3", "--debounce-ms", "20", "--", "echo", "hi"]

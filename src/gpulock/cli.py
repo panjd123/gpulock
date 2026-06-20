@@ -289,11 +289,22 @@ def _run_serve_command(args: argparse.Namespace) -> int:
 #   <lhost>:<listen>:<backend>               e.g. 0.0.0.0:8000:8001
 #   <lhost>:<listen>:<bhost>:<backend>       e.g. 0.0.0.0:8000:127.0.0.1:8001
 # A 3-segment form attaches the host to the listen side (backend stays local).
+# IPv6 literals must be bracketed so their colons don't clash with the spec
+# separators, e.g. ``[::]:8000:[::1]:8001`` or ``[::]:8000:8001``.
+_PROXY_HOST = r"(?:\[[0-9A-Fa-f:]+\]|[^:/\[\]]+)"
 _PROXY_SPEC_RE = re.compile(
-    r"^(?:(?P<lhost>[^:/]+):)?(?P<listen>\d+):(?:(?P<bhost>[^:/]+):)?(?P<backend>\d+)$"
+    rf"^(?:(?P<lhost>{_PROXY_HOST}):)?(?P<listen>\d+):"
+    rf"(?:(?P<bhost>{_PROXY_HOST}):)?(?P<backend>\d+)$"
 )
 # Backward-compatible alias kept for tests/imports.
 _LISTEN_BACKEND_RE = _PROXY_SPEC_RE
+
+
+def _strip_host_brackets(host: str) -> str:
+    """Drop the brackets around an IPv6 literal (``[::1]`` -> ``::1``)."""
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
 
 
 def _parse_proxy_spec(spec: str) -> tuple[str, int, str, int] | None:
@@ -301,12 +312,14 @@ def _parse_proxy_spec(spec: str) -> tuple[str, int, str, int] | None:
 
     Returns ``None`` if the string is not a valid proxy spec. Missing host parts
     default to ``0.0.0.0`` for the listen side and ``127.0.0.1`` for the backend.
+    A bare wildcard listen host binds both IPv4 and IPv6 (handled downstream).
+    IPv6 literal hosts are returned without their brackets.
     """
     m = _PROXY_SPEC_RE.match(spec.strip())
     if not m:
         return None
-    listen_host = m.group("lhost") or "0.0.0.0"
-    backend_host = m.group("bhost") or "127.0.0.1"
+    listen_host = _strip_host_brackets(m.group("lhost") or "0.0.0.0")
+    backend_host = _strip_host_brackets(m.group("bhost") or "127.0.0.1")
     return listen_host, int(m.group("listen")), backend_host, int(m.group("backend"))
 
 

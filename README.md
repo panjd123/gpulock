@@ -15,6 +15,8 @@ gpulock perf  0 -- python benchmarks/run.py       # exclusive write lock → per
 
 [Quick start](#quick-start) · [Commands](#command-reference) · [AI agents](#using-gpulock-with-ai-agents) · [Guard service](#the-guard-service) · [How it works](#how-it-works)
 
+> 📘 **Full recipe — gpulock + vLLM + Claude Code:** [`docs/claude-code-vllm-gpulock.md`](docs/claude-code-vllm-gpulock.md) (install → serve a local model → connect Claude Code over IPv4/IPv6, with latency-first MTP and tool calling).
+
 **English** | [简体中文](README.zh-CN.md)
 
 Built for multi-agent GPU coding. With this tool you can:
@@ -145,6 +147,18 @@ and the backend host to `127.0.0.1`. So `8000:8001`, `127.0.0.1:8000:8001`,
 `8000:127.0.0.1:8001`, and `0.0.0.0:8000:127.0.0.1:8001` are all valid. The
 proxy listens on the listen side and forwards to the backend side, streaming
 responses (including SSE / streaming chat completions) through unchanged.
+
+**IPv4 / IPv6 dual-stack.** A wildcard listen host (the default `0.0.0.0`, or an
+explicit `::`/`*`) binds **both** IPv4 and IPv6, so clients can connect over
+either stack on the same port. Upstream forwarding is **IPv4-first** (the backend
+defaults to `127.0.0.1`, with IPv6 as a fallback). IPv6 literals must be
+bracketed in the spec, e.g. `[::]:8000:8001` or `[::]:8000:[::1]:8001`.
+
+> **Complete guide:** [`docs/claude-code-vllm-gpulock.md`](docs/claude-code-vllm-gpulock.md)
+> is a full, from-scratch walkthrough of **gpulock + vLLM + Claude Code** —
+> installing gpulock and the guard service, launching vLLM behind `gpulock serve`
+> (latency-first MTP, tool calling, IPv4/IPv6 dual-stack), and pointing Claude
+> Code at the local server. Follow it end to end and you need no other docs.
 
 **How active/park works.** The proxy counts *real* in-flight requests and
 writes two files under the lock root:

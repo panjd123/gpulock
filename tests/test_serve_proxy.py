@@ -225,3 +225,85 @@ def test_proxy_forwards_and_signals(fake_backend):
 
     asyncio.run(scenario())
     assert counter.count == 0
+
+
+# ---------------------------------------------------------------------------
+# Dual-stack listening + IPv4-first upstream
+# ---------------------------------------------------------------------------
+
+def test_format_host_for_url_brackets_ipv6():
+    assert sp._format_host_for_url("127.0.0.1") == "127.0.0.1"
+    assert sp._format_host_for_url("localhost") == "localhost"
+    assert sp._format_host_for_url("::1") == "[::1]"
+    assert sp._format_host_for_url("2001:db8::1") == "[2001:db8::1]"
+    # already bracketed stays unchanged
+    assert sp._format_host_for_url("[::1]") == "[::1]"
+
+
+def test_make_listen_sockets_wildcard_is_dual_stack():
+    port = _free_port()
+    socks = sp._make_listen_sockets("0.0.0.0", port)
+    try:
+        families = {s.family for s in socks}
+        assert socket.AF_INET in families
+        if socket.has_ipv6:
+            assert socket.AF_INET6 in families
+            # The IPv6 socket must be V6ONLY so it can share the port with IPv4.
+            v6 = next(s for s in socks if s.family == socket.AF_INET6)
+            assert v6.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        # every socket is bound to the requested port
+        assert all(s.getsockname()[1] == port for s in socks)
+    finally:
+        for s in socks:
+            s.close()
+
+
+def test_make_listen_sockets_specific_host_single_family():
+    port = _free_port()
+    socks = sp._make_listen_sockets("127.0.0.1", port)
+    try:
+        assert len(socks) == 1
+        assert socks[0].family == socket.AF_INET
+    finally:
+        for s in socks:
+            s.close()
+
+
+@pytest.mark.skipif(not socket.has_ipv6, reason="IPv6 unavailable")
+def test_proxy_serves_over_ipv4_and_ipv6_when_wildcard(fake_backend):
+    import aiohttp
+
+    listen_port = _free_port()
+    counter = sp.RequestCounter(
+        on_busy=lambda: None,
+        on_idle=lambda: None,
+        debounce_s=0.05,
+    )
+    rules = sp.DEFAULT_IGNORE_RULES
+
+    async def scenario():
+        stop = asyncio.Event()
+        ready = asyncio.Event()
+        proxy_task = asyncio.create_task(
+            sp.run_proxy(
+                "0.0.0.0", listen_port,
+                "127.0.0.1", fake_backend,
+                counter, rules,
+                ready_event=ready, stop_event=stop,
+            )
+        )
+        await ready.wait()
+        async with aiohttp.ClientSession() as s:
+            # IPv4 client
+            async with s.post(f"http://127.0.0.1:{listen_port}/v1/chat/completions", json={}) as r:
+                assert r.status == 200
+                assert await r.read() == b"hello"
+            # IPv6 client hitting the same wildcard proxy
+            async with s.post(f"http://[::1]:{listen_port}/v1/chat/completions", json={}) as r:
+                assert r.status == 200
+                assert await r.read() == b"hello"
+        stop.set()
+        await proxy_task
+
+    asyncio.run(scenario())
+    assert counter.count == 0
