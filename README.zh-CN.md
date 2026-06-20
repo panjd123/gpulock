@@ -95,6 +95,7 @@ gpulock check <gpu_ids> -- <cmd>     # 读锁  —— 共享；适合正确性�
 gpulock read  <gpu_ids> -- <cmd>     # check 的别名
 gpulock perf  <gpu_ids> -- <cmd>     # 写锁  —— 独占；适合性能测试 / profiling
 gpulock write <gpu_ids> -- <cmd>     # perf 的别名
+gpulock serve <listen>:<backend> <gpu_ids> -- <cmd>   # 通过请求感知反向代理托管推理服务
 ```
 
 - `<gpu_ids>` 可以是单个编号（`0`），也可以是逗号分隔的列表（`0,1,2`）。编号会被排序并去重。
@@ -111,6 +112,65 @@ gpulock write <gpu_ids> -- <cmd>     # perf 的别名
 | `--timeout-s` | 1800 | 等待锁的最长时间 |
 | `--grace-age-s` | 180 | 陈旧锁保护期 |
 | `--heartbeat-s` | 2 | 心跳间隔 |
+
+## serve 模式（推理服务）
+
+`gpulock serve` 用于托管长时间运行的推理服务（vLLM、SGLang，或任意兼容
+OpenAI 接口的 HTTP 服务）：整个生命周期内 GPU 都被写锁**持有**——其它
+`gpulock` 任务会排队等待——但在两次请求**之间**，guard 的占位进程会继续把
+显卡跑满；一旦有请求进来，占位进程立即让位。它**不需要改动推理框架的任何
+代码**：gpulock 在原生后端前面起一个轻量反向代理。
+
+**一条命令**——把你平时的启动命令原样接在 `--` 后面即可；客户端继续用原来的
+端口，只是后端换到另一个端口：
+
+```bash
+# 客户端访问 8000 端口；vLLM 原生跑在 8001；占用 GPU 2,3。
+gpulock serve 8000:8001 2,3 -- \
+    vllm serve /models/DeepSeek-V4-Flash-NVFP4 \
+        --port 8001 --host 127.0.0.1 --tensor-parallel-size 2
+```
+
+这一行会自动完成：取锁、启动后端、运行请求感知代理，并在退出时清理一切。
+（请先在主机上执行一次 `gpulock service install` 让 guard 生效，详见
+[守护服务](#守护服务)。）
+
+代理规格为 `[lhost:]<listen_port>:[bhost:]<backend_port>`。两侧的 host 都是可选
+且相互独立的：监听侧 host 默认 `0.0.0.0`，后端侧 host 默认 `127.0.0.1`。因此
+`8000:8001`、`127.0.0.1:8000:8001`、`8000:127.0.0.1:8001`、
+`0.0.0.0:8000:127.0.0.1:8001` 都是合法写法。代理在监听侧接收请求，转发到后端侧，
+并原样流式透传响应（包括 SSE / 流式 chat completions）。
+
+**active/park 的工作方式。** 代理统计*真实*在途请求数，并在 lock root 下写入
+两个文件：
+
+- `serve.managed`（服务存活期间一直存在）告诉 guard 这张卡由 serve 托管，因此
+  代理自己持有的写锁**不会**强制占位进程一直 park。
+- `serve.busy` 在第一个真实请求到达时置位，在最后一个请求结束（经过短暂防抖）
+  后清除。
+
+guard 随后完全依据 `serve.busy` 来驱动占位进程：有请求在途时 **park**（后端
+独占整张卡），空闲时 **active**（仅占算力），避免显卡被集群回收。
+
+**心跳黑名单。** 存活/就绪/元信息探测请求绝不会被算作真实活动，因此轮询健康
+检查或拉取模型列表不会让占位进程一直 park。默认黑名单包含 `GET` 的
+`/health`、`/healthz`、`/health_generate`、`/ready`、`/ping`、`/metrics`、
+`/stats`、`/load`、`/version`、`/get_model_info`、`/get_server_info`、
+`/v1/models`（以及 `/v1/models/<id>`），以及所有 CORS `OPTIONS` 预检。其余请求
+（`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/generate` 等）
+都会计数并触发 active。
+
+可通过 `--ignore [METHOD:]PATH`（可重复）、`--ignore-reset`（丢弃默认黑名单），
+或环境变量 `GPULOCK_SERVE_IGNORE` / `GPULOCK_SERVE_IGNORE_RESET` 来追加或替换
+黑名单。裸路径默认匹配 `GET` 方法；路径按精确或前缀匹配。
+
+| serve 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--debounce-ms` | 50 | 清除 `serve.busy` 前的空闲防抖时间 |
+| `--ignore` | — | 额外的心跳路径（`[METHOD:]PATH`，可重复） |
+| `--ignore-reset` | 关闭 | 丢弃内置心跳黑名单 |
+| `--timeout-s` | 1800 | 等待写锁的最长时间 |
+| `--no-wait-gpu-idle` | 关闭 | 取锁前跳过 GPU 空闲预检查 |
 
 ## 配合 AI Agent 使用
 

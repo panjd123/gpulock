@@ -14,6 +14,7 @@ def test_pyproject_declares_current_entrypoint_and_dependencies():
         "setproctitle>=1.3; platform_system == 'Linux'",
         "supervisor>=4.2",
         "torch",
+        "aiohttp>=3.9",
     ]
     assert pyproject["project"]["scripts"] == {
         "gpulock": "gpulock.cli:main",

@@ -97,6 +97,7 @@ gpulock check <gpu_ids> -- <cmd>     # read lock  — shared; suited to correctn
 gpulock read  <gpu_ids> -- <cmd>     # alias for check
 gpulock perf  <gpu_ids> -- <cmd>     # write lock — exclusive; suited to perf/profiling
 gpulock write <gpu_ids> -- <cmd>     # alias for perf
+gpulock serve <listen>:<backend> <gpu_ids> -- <cmd>   # inference server behind a request-aware reverse proxy
 ```
 
 - `<gpu_ids>` is a single index (`0`) or a comma-separated list (`0,1,2`). IDs are sorted and deduplicated.
@@ -113,6 +114,72 @@ Per-run flags (see `gpulock <mode> --help` for the complete list):
 | `--timeout-s` | 1800 | Maximum time to wait for a lock |
 | `--grace-age-s` | 180 | Stale-lock protection window |
 | `--heartbeat-s` | 2 | Heartbeat interval |
+
+## Serve mode (inference servers)
+
+`gpulock serve` runs a long-lived inference server (vLLM, SGLang, or any
+OpenAI-compatible HTTP server) so that the GPU is **held** by a write lock the
+whole time — other `gpulock` jobs queue behind it — yet the idle guard's
+placeholder keeps the card utilized **between** requests and instantly steps
+aside while requests are being served. It does this without patching the
+inference framework: gpulock runs a small reverse proxy in front of the
+unmodified backend.
+
+**One command** — wrap your normal launch command after `--`; clients keep using
+the original port, only the backend moves to a second port:
+
+```bash
+# Public clients hit port 8000; vLLM runs natively on 8001; GPUs 2,3 are held.
+gpulock serve 8000:8001 2,3 -- \
+    vllm serve /models/DeepSeek-V4-Flash-NVFP4 \
+        --port 8001 --host 127.0.0.1 --tensor-parallel-size 2
+```
+
+That single line acquires the lock, starts the backend, runs the request-aware
+proxy, and cleans everything up on exit. (Run `gpulock service install` once on
+the host so the guard is active — see [the guard service](#the-guard-service).)
+
+The spec is `[lhost:]<listen_port>:[bhost:]<backend_port>`. The host parts are
+optional and independent on either side: the listen host defaults to `0.0.0.0`
+and the backend host to `127.0.0.1`. So `8000:8001`, `127.0.0.1:8000:8001`,
+`8000:127.0.0.1:8001`, and `0.0.0.0:8000:127.0.0.1:8001` are all valid. The
+proxy listens on the listen side and forwards to the backend side, streaming
+responses (including SSE / streaming chat completions) through unchanged.
+
+**How active/park works.** The proxy counts *real* in-flight requests and
+writes two files under the lock root:
+
+- `serve.managed` (for the lifetime of the server) tells the guard this GPU is
+  serve-owned, so the proxy's own write lock does **not** force the placeholder
+  to stay parked.
+- `serve.busy` is set when the first real request arrives and cleared (after a
+  short debounce) when the last one finishes.
+
+The guard then drives the placeholder purely from `serve.busy`: **parked** while
+requests are in flight (the backend gets the whole GPU), **active**
+(compute-only) when idle so the card is not reclaimed by the cluster.
+
+**Heartbeat blacklist.** Liveness/readiness/metadata probes never count as real
+activity, so a polling health check or model-list fetch will not keep the
+placeholder parked. The default blacklist covers `GET` on `/health`,
+`/healthz`, `/health_generate`, `/ready`, `/ping`, `/metrics`, `/stats`,
+`/load`, `/version`, `/get_model_info`, `/get_server_info`, `/v1/models`
+(and `/v1/models/<id>`), plus all CORS `OPTIONS` preflights. Everything else
+(`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/generate`, …)
+counts and triggers active.
+
+Add or replace blacklist entries with `--ignore [METHOD:]PATH` (repeatable),
+`--ignore-reset` (drop the defaults), or the `GPULOCK_SERVE_IGNORE` /
+`GPULOCK_SERVE_IGNORE_RESET` environment variables. Bare paths default to the
+`GET` method; paths match exactly or as a prefix.
+
+| Serve flag | Default | Meaning |
+|---|---:|---|
+| `--debounce-ms` | 50 | Idle debounce before `serve.busy` is cleared |
+| `--ignore` | — | Extra heartbeat path to ignore (`[METHOD:]PATH`, repeatable) |
+| `--ignore-reset` | off | Drop the built-in heartbeat blacklist |
+| `--timeout-s` | 1800 | Maximum time to wait for the write lock |
+| `--no-wait-gpu-idle` | off | Skip the GPU-idle precheck before taking the lock |
 
 ## Using gpulock with AI agents
 

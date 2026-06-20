@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 from .config import LockConfig, READ_MODE, WRITE_MODE
 from .config import env_int as _env_int
@@ -246,6 +248,30 @@ def _clear_serve_signal(gpu_ids: list[int]) -> None:
         path.unlink(missing_ok=True)
 
 
+def _get_serve_managed_paths(gpu_ids: list[int]) -> list[Path]:
+    """Return the paths to serve-managed marker files for the given GPU IDs.
+
+    The marker tells the guard that this GPU is owned by a ``gpulock serve``
+    reverse proxy, so it should drive placeholder park/activate from the
+    ``serve.busy`` signal rather than parking unconditionally on our write lock.
+    """
+    lock_root = resolve_lock_root()
+    return [lock_root / f"gpu{gid}" / "serve.managed" for gid in gpu_ids]
+
+
+def _set_serve_managed(gpu_ids: list[int]) -> None:
+    """Mark GPUs as managed by a serve reverse proxy (records our pid)."""
+    for path in _get_serve_managed_paths(gpu_ids):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"pid={os.getpid()}\n")
+
+
+def _clear_serve_managed(gpu_ids: list[int]) -> None:
+    """Remove serve-managed marker files."""
+    for path in _get_serve_managed_paths(gpu_ids):
+        path.unlink(missing_ok=True)
+
+
 def _run_serve_command(args: argparse.Namespace) -> int:
     """Run a command in serve mode: write lock + signal file coordination.
 
@@ -256,6 +282,227 @@ def _run_serve_command(args: argparse.Namespace) -> int:
     # Serve mode uses WRITE_MODE (exclusive lock) like perf
     args.mode = WRITE_MODE
     return _run_locked_command(args)
+
+
+# Proxy spec forms (host parts optional, independently, on either side):
+#   <listen>:<backend>                       e.g. 8000:8001
+#   <lhost>:<listen>:<backend>               e.g. 0.0.0.0:8000:8001
+#   <lhost>:<listen>:<bhost>:<backend>       e.g. 0.0.0.0:8000:127.0.0.1:8001
+# A 3-segment form attaches the host to the listen side (backend stays local).
+_PROXY_SPEC_RE = re.compile(
+    r"^(?:(?P<lhost>[^:/]+):)?(?P<listen>\d+):(?:(?P<bhost>[^:/]+):)?(?P<backend>\d+)$"
+)
+# Backward-compatible alias kept for tests/imports.
+_LISTEN_BACKEND_RE = _PROXY_SPEC_RE
+
+
+def _parse_proxy_spec(spec: str) -> tuple[str, int, str, int] | None:
+    """Parse a proxy spec into (listen_host, listen_port, backend_host, backend_port).
+
+    Returns ``None`` if the string is not a valid proxy spec. Missing host parts
+    default to ``0.0.0.0`` for the listen side and ``127.0.0.1`` for the backend.
+    """
+    m = _PROXY_SPEC_RE.match(spec.strip())
+    if not m:
+        return None
+    listen_host = m.group("lhost") or "0.0.0.0"
+    backend_host = m.group("bhost") or "127.0.0.1"
+    return listen_host, int(m.group("listen")), backend_host, int(m.group("backend"))
+
+
+def _parse_serve_proxy_args(argv: list[str]) -> argparse.Namespace:
+    """Parse ``serve <[host:]listen:backend> <gpu_ids> [--opts] -- <cmd>``."""
+    try:
+        sep_idx = argv.index("--")
+    except ValueError:
+        sep_idx = len(argv)
+    head = argv[:sep_idx]
+    command = argv[sep_idx:]
+
+    parser = argparse.ArgumentParser(prog="gpulock serve", add_help=True)
+    parser.add_argument(
+        "listen_backend",
+        help="proxy spec: [host:]<listen_port>:<backend_port> (e.g. 8000:8001)",
+    )
+    parser.add_argument(
+        "gpu_ids", help="GPU indices: single int or comma-separated (e.g. 2,3)."
+    )
+    parser.add_argument("--timeout-s", type=int, default=LockConfig.from_env().timeout_s)
+    parser.add_argument("--no-wait-gpu-idle", action="store_true")
+    parser.add_argument(
+        "--debounce-ms", type=int, default=50,
+        help="idle debounce before clearing serve.busy (default 50ms).",
+    )
+    parser.add_argument(
+        "--ignore", action="append", default=[], metavar="[METHOD:]PATH",
+        help="extra request path to treat as a heartbeat (never triggers active). "
+             "Repeat to add more; also reads GPULOCK_SERVE_IGNORE env.",
+    )
+    parser.add_argument(
+        "--ignore-reset", action="store_true",
+        help="drop the built-in heartbeat blacklist; only --ignore/env rules apply.",
+    )
+    args = parser.parse_args(head)
+    args.command = command
+    return args
+
+
+def _run_serve_proxy_command(argv: list[str]) -> int:
+    """Run ``gpulock serve <listen>:<backend> <gpus> -- <cmd>``.
+
+    Holds an exclusive write lock on the GPUs, launches the backend command,
+    and runs an in-process reverse proxy that forwards ``listen`` -> ``backend``
+    while counting real (non-heartbeat) in-flight requests. The proxy drives the
+    serve.busy signal so the guard parks the placeholder while serving and
+    reactivates it when idle. The backend server is never patched.
+    """
+    import asyncio
+    import signal
+    import threading
+
+    from .serve_proxy import (
+        RequestCounter,
+        ignore_rules_from_env,
+        run_proxy,
+    )
+    from .serve_proxy import _wait_backend_ready
+
+    log = setup_main_logger(resolve_lock_root())
+    args = _parse_serve_proxy_args(argv)
+
+    m = _parse_proxy_spec(args.listen_backend)
+    if m is None:
+        print(
+            "[gpulock] invalid serve spec; expected "
+            "[lhost:]<listen>:[bhost:]<backend>, "
+            f"got {args.listen_backend!r}",
+            file=sys.stderr,
+        )
+        return 2
+    listen_host, listen_port, backend_host, backend_port = m
+
+    try:
+        gpu_ids = _parse_gpu_ids(args.gpu_ids)
+    except ValueError as e:
+        print(f"[gpulock] {e}", file=sys.stderr)
+        return 2
+
+    try:
+        command = _normalize_command(args.command)
+    except ValueError as e:
+        print(f"[gpulock] {e}", file=sys.stderr)
+        return 2
+
+    gpu_ids_str = ",".join(str(g) for g in gpu_ids)
+    if args.ignore_reset:
+        from .serve_proxy import parse_ignore_rules
+        rules = parse_ignore_rules(args.ignore, reset=True)
+    else:
+        rules = ignore_rules_from_env(args.ignore)
+
+    cfg = LockConfig(timeout_s=max(args.timeout_s, 1))
+    session = MultiGpuLock(
+        gpu_ids=gpu_ids,
+        mode=WRITE_MODE,
+        config=cfg,
+        skip_gpu_idle_check=bool(args.no_wait_gpu_idle),
+    )
+    try:
+        session.acquire()
+    except TimeoutError as e:
+        print(f"[GPU Lock] timeout: {e}", file=sys.stderr)
+        return 124
+    except Exception as e:
+        print(f"[GPU Lock] acquire failed: {e}", file=sys.stderr)
+        return 1
+
+    session.register_process_cleanup()
+    _set_serve_managed(gpu_ids)
+    print(
+        f"[GPU Lock] acquired mode=serve devices={gpu_ids_str} "
+        f"proxy={listen_host}:{listen_port}->{backend_host}:{backend_port} "
+        f"lock_paths={session.lock_paths_str()}",
+        flush=True,
+    )
+    log.info(
+        "serve proxy start gpus=%s listen=%s:%d backend=%s:%d cmd=%s",
+        gpu_ids_str, listen_host, listen_port, backend_host, backend_port, command,
+    )
+
+    child_env = os.environ.copy()
+    child_env.update(session.child_env_overrides())
+    child_env["GPULOCK_SERVE_GPUS"] = gpu_ids_str
+    child_env["GPULOCK_SERVE_BACKEND_PORT"] = str(backend_port)
+
+    backend_proc = subprocess.Popen(
+        command,
+        shell=True,
+        executable="/bin/bash",
+        env=child_env,
+    )
+
+    counter = RequestCounter(
+        on_busy=lambda: _touch_serve_signal(gpu_ids),
+        on_idle=lambda: _clear_serve_signal(gpu_ids),
+        debounce_s=max(args.debounce_ms, 0) / 1000.0,
+    )
+
+    async def _serve() -> int:
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _request_stop() -> None:
+            stop_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with __import__("contextlib").suppress(NotImplementedError):
+                loop.add_signal_handler(sig, _request_stop)
+
+        # Watch the backend: if it dies, stop the proxy.
+        def _watch_backend() -> None:
+            backend_proc.wait()
+            with __import__("contextlib").suppress(RuntimeError):
+                loop.call_soon_threadsafe(stop_event.set)
+
+        threading.Thread(target=_watch_backend, daemon=True).start()
+
+        await _wait_backend_ready(f"http://{backend_host}:{backend_port}")
+        await run_proxy(
+            listen_host,
+            listen_port,
+            backend_host,
+            backend_port,
+            counter,
+            rules,
+            stop_event=stop_event,
+        )
+        return 0
+
+    rc = 0
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        rc = 130
+    except Exception as e:  # noqa: BLE001
+        log.exception("serve proxy failed gpus=%s err=%s", gpu_ids_str, e)
+        print(f"[gpulock serve] proxy error: {e}", file=sys.stderr)
+        rc = 1
+    finally:
+        if backend_proc.poll() is None:
+            backend_proc.terminate()
+            try:
+                backend_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                backend_proc.kill()
+        backend_rc = backend_proc.returncode
+        if backend_rc is not None and backend_rc != 0 and rc == 0:
+            rc = backend_rc
+        _clear_serve_signal(gpu_ids)
+        _clear_serve_managed(gpu_ids)
+        session.release()
+        print(f"[GPU Lock] released mode=serve devices={gpu_ids_str}", flush=True)
+    log.info("serve proxy finished gpus=%s rc=%d", gpu_ids_str, rc)
+    return int(rc)
 
 
 def main() -> int:
@@ -270,6 +517,13 @@ def main() -> int:
             return cmd_service(sys.argv[2:])
         if sub == "agent":
             return cmd_agent(sys.argv[2:])
+        if sub == "serve":
+            # Reverse-proxy serve mode: the first token after `serve` is a
+            # [host:]<listen>:<backend> spec. Otherwise fall through to the
+            # legacy `serve <gpus> -- cmd` (write lock only) handler below.
+            rest = sys.argv[2:]
+            if rest and _LISTEN_BACKEND_RE.match(rest[0].strip()):
+                return _run_serve_proxy_command(rest)
         if sub == "_serve_signal":
             # Internal command: touch or clear serve signal files
             # Usage: gpulock _serve_signal <gpu_ids> <on|off>

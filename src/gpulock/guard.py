@@ -329,6 +329,22 @@ def cmd_guard(argv: list[str]) -> int:
         """Check if a serve-mode process has signaled it's busy."""
         return serve_signal_file(gid).exists()
 
+    def serve_managed_file(gid: int) -> Path:
+        """Path to the serve-managed marker file for a GPU.
+
+        When this file exists, a ``gpulock serve`` reverse proxy owns the GPU.
+        The proxy holds a write lock the whole time (so other gpulock jobs
+        queue), which would normally make the guard park the placeholder
+        unconditionally. The marker tells the guard to instead drive placeholder
+        park/activate from the ``serve.busy`` signal: parked while requests are
+        in flight, active (compute-only) when idle to keep utilization up.
+        """
+        return lock_root / f"gpu{gid}" / "serve.managed"
+
+    def is_serve_managed(gid: int) -> bool:
+        """Check if a serve reverse proxy currently owns this GPU."""
+        return serve_managed_file(gid).exists()
+
     def gpu_is_idle_for_placeholder(gid: int) -> bool:
         """Check if placeholder may activate on this GPU.
 
@@ -339,7 +355,13 @@ def cmd_guard(argv: list[str]) -> int:
 
         The serve signal file is how gpulock serve processes tell the
         guard they have active requests and placeholder should stay parked.
+
+        Exception: when the GPU is serve-managed, the serve proxy's own write
+        lock is expected and must not block activation. In that case the
+        decision is driven purely by the serve.busy signal (idle when absent).
         """
+        if is_serve_managed(gid):
+            return not has_serve_signal(gid)
         if gpu_has_our_activity(lock_root, gid):
             return False
         ext_pids = external_gpu_compute_pids(gid)
@@ -379,10 +401,15 @@ def cmd_guard(argv: list[str]) -> int:
 
         reason = "placeholder active"
         serve_busy = has_serve_signal(gid)
+        serve_managed = is_serve_managed(gid)
         if not ph_alive and gid in placeholder_fail_reported:
             reason = "placeholder worker failed to start; see guard log"
         elif gid in dormant:
             reason = f"dormant: no user GPU activity for {args.idle_timeout}s"
+        elif serve_managed and serve_busy:
+            reason = "parked: serve proxy has in-flight requests"
+        elif serve_managed:
+            reason = "active: serve proxy idle (no in-flight requests)"
         elif our_active:
             reason = "parked: gpulock lock or queue activity detected"
         elif rt is None:
@@ -427,6 +454,8 @@ def cmd_guard(argv: list[str]) -> int:
             "placeholder_pid": proc.pid if ph_alive and proc is not None else None,
             "dormant": gid in dormant,
             "our_activity": our_active,
+            "serve_managed": serve_managed,
+            "serve_busy": serve_busy,
             "recent_pulse": recent_pulse,
             "idle_for_s": max(now - idle_since[gid], 0.0) if gid in idle_since else None,
             "last_gpulock_activity_age_s": last_gpulock_activity_age,
@@ -563,8 +592,9 @@ def cmd_guard(argv: list[str]) -> int:
                 our_active = gpu_has_our_activity(lock_root, gid)
                 recent_pulse = _has_recent_pulse(last_pulse_ts, gid, max(args.placeholder_idle_s, 0.0))
                 serve_busy = has_serve_signal(gid)
+                serve_managed = is_serve_managed(gid)
 
-                if our_active:
+                if our_active and not serve_managed:
                     record_gpulock_activity(conn, gid, time.time())
                     if ph_alive:
                         park_placeholder_worker(gid, "our process/lock detected")
@@ -573,9 +603,22 @@ def cmd_guard(argv: list[str]) -> int:
                         dormant.discard(gid)
                         log.info("gpu%d: woke from dormant (our activity detected)", gid)
                 elif serve_busy:
-                    # Serve process has active requests — keep placeholder parked
+                    # Serve process has active requests — keep placeholder parked.
+                    # (Covers both serve-managed GPUs and the legacy hook flow.)
                     if ph_alive and gid in placeholder_active:
                         park_placeholder_worker(gid, "serve signal present")
+                    idle_since.pop(gid, None)
+                    if gid in dormant:
+                        dormant.discard(gid)
+                elif serve_managed:
+                    # Serve proxy owns the GPU and has no in-flight requests:
+                    # activate the placeholder (compute-only) to keep utilization
+                    # up. Its own write lock is expected and must not block this.
+                    if not (ph_alive and gid in placeholder_active):
+                        activate_placeholder_worker(gid, "serve idle (no requests)")
+                        if should_exit_for_placeholder_failures:
+                            cleanup()
+                            return 70
                     idle_since.pop(gid, None)
                     if gid in dormant:
                         dormant.discard(gid)
