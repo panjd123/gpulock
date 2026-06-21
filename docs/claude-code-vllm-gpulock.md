@@ -178,6 +178,7 @@ gpulock serve "8100:8101" 0 -- \
 
 要点：
 
+- **后端 ready 默认无限等待**：`gpulock serve` 会先等 backend 端口（这里是 `127.0.0.1:8101`）真正可连接，再开放 public 代理端口。大模型首次启动可能长时间编译、autotune、profile KV cache、capture CUDA graph；默认无限等待可以避免中途超时导致重新来过。确实需要上限时，用 `--backend-ready-timeout-s <秒数>`；超时默认失败退出，不会提前对外提供 502。只有明确想保留旧的 best-effort 行为时，才加 `--backend-ready-timeout-action proxy`。
 - **`--enable-auto-tool-choice --tool-call-parser qwen3_coder`**：Claude Code 能用工具的关键。
   - 实测：用 `hermes` 时 Claude Code 调不动工具（模型只复述任务）；换 `qwen3_coder` 后 `Read` 等工具能真正触发。
   - 缺 `--enable-auto-tool-choice` 时，Claude Code 默认的 `tool_choice="auto"` 会被 vLLM 拒绝（`400 "auto" tool choice requires --enable-auto-tool-choice ...`）。
@@ -257,6 +258,7 @@ ss -ltnH | awk '$4 ~ /:8100$/ {print $1, $4}'
 - **省略 backend host** → 默认 `127.0.0.1`。
 - **IPv6 字面量必须加方括号**（冒号会和端口分隔符冲突），例如 `[::1]`、`[2001:db8::1]`。
 - 对内转发是 **IPv4 优先**：解析结果把 IPv4 排前面，IPv6 作回退。所以 vLLM 绑 `127.0.0.1` 时走的就是 IPv4，没有多余的 `::1` 尝试。
+- **backend ready 等待默认无超时**：`gpulock serve` 只有在 backend TCP 端口可连接后才启动 public 代理。需要有限等待时使用 `--backend-ready-timeout-s <秒数>`；需要即使 backend 不可用也先开放代理时，再加 `--backend-ready-timeout-action proxy`。
 
 ---
 

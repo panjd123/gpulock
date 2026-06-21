@@ -55,12 +55,33 @@ def test_parse_proxy_spec_ipv6_literals():
 
 def test_parse_serve_proxy_args_splits_command_and_options():
     args = _parse_serve_proxy_args(
-        ["8000:8001", "2,3", "--debounce-ms", "20", "--", "echo", "hi"]
+        [
+            "8000:8001",
+            "2,3",
+            "--debounce-ms",
+            "20",
+            "--backend-ready-timeout-s",
+            "123",
+            "--backend-ready-timeout-action",
+            "proxy",
+            "--",
+            "echo",
+            "hi",
+        ]
     )
     assert args.listen_backend == "8000:8001"
     assert args.gpu_ids == "2,3"
     assert args.debounce_ms == 20
+    assert args.backend_ready_timeout_s == 123
+    assert args.backend_ready_timeout_action == "proxy"
     assert args.command == ["--", "echo", "hi"]
+
+
+def test_parse_serve_proxy_args_defaults_to_no_backend_ready_timeout():
+    args = _parse_serve_proxy_args(["8000:8001", "2,3", "--", "echo", "hi"])
+    assert args.backend_ready_timeout_s is None
+    assert args.no_backend_ready_timeout is False
+    assert args.backend_ready_timeout_action == "fail"
 
 
 def _free_port() -> int:

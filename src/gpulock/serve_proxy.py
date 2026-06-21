@@ -327,24 +327,30 @@ def build_proxy_app(
     return app
 
 
-async def _wait_backend_ready(backend_url: str, timeout_s: float = 600.0) -> None:
-    """Best-effort wait until the backend TCP port accepts connections."""
+async def _wait_backend_ready(backend_url: str, timeout_s: float | None = None) -> bool:
+    """Wait until the backend TCP port accepts connections.
+
+    Returns True when the backend is reachable and False when the timeout is
+    reached. Callers decide whether a timeout should fail the serve command or
+    start proxying anyway.
+    """
     from urllib.parse import urlparse
 
     parsed = urlparse(backend_url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 80
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    deadline = None if timeout_s is None or timeout_s <= 0 else time.monotonic() + timeout_s
+    while deadline is None or time.monotonic() < deadline:
         try:
             reader, writer = await asyncio.open_connection(host, port)
             writer.close()
             with __import__("contextlib").suppress(Exception):
                 await writer.wait_closed()
-            return
+            return True
         except OSError:
             await asyncio.sleep(0.5)
-    logger.warning("backend %s not reachable after %.0fs; proxying anyway", backend_url, timeout_s)
+    logger.warning("backend %s not reachable after %.0fs", backend_url, timeout_s or 0)
+    return False
 
 
 def _format_host_for_url(host: str) -> str:

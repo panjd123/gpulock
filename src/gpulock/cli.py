@@ -343,6 +343,30 @@ def _parse_serve_proxy_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=int, default=LockConfig.from_env().timeout_s)
     parser.add_argument("--no-wait-gpu-idle", action="store_true")
     parser.add_argument(
+        "--backend-ready-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "seconds to wait for the backend TCP port before starting the proxy. "
+            "Unset means wait forever, which is the default for very slow cold starts."
+        ),
+    )
+    parser.add_argument(
+        "--no-backend-ready-timeout",
+        action="store_true",
+        help="wait forever for the backend TCP port before starting the proxy.",
+    )
+    parser.add_argument(
+        "--backend-ready-timeout-action",
+        choices=("fail", "proxy"),
+        default=os.environ.get("GPULOCK_SERVE_BACKEND_READY_TIMEOUT_ACTION", "fail"),
+        help=(
+            "what to do if backend readiness times out: fail exits instead of "
+            "serving 502s; proxy preserves the old best-effort behavior "
+            "(default fail; env GPULOCK_SERVE_BACKEND_READY_TIMEOUT_ACTION)."
+        ),
+    )
+    parser.add_argument(
         "--debounce-ms", type=int, default=50,
         help="idle debounce before clearing serve.busy (default 50ms).",
     )
@@ -479,7 +503,28 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
 
         threading.Thread(target=_watch_backend, daemon=True).start()
 
-        await _wait_backend_ready(f"http://{backend_host}:{backend_port}")
+        backend_url = f"http://{backend_host}:{backend_port}"
+        backend_ready_timeout_s = None
+        if not args.no_backend_ready_timeout and args.backend_ready_timeout_s is not None:
+            backend_ready_timeout_s = max(float(args.backend_ready_timeout_s), 0.0)
+        ready = await _wait_backend_ready(backend_url, timeout_s=backend_ready_timeout_s)
+        if not ready and args.backend_ready_timeout_action == "fail":
+            waited = (
+                "forever"
+                if backend_ready_timeout_s is None
+                else f"{backend_ready_timeout_s:.0f}s"
+            )
+            print(
+                "[gpulock serve] backend "
+                f"{backend_url} was not reachable after "
+                f"{waited}; exiting instead "
+                "of proxying 502s. Increase --backend-ready-timeout-s for slow "
+                "cold starts, pass --no-backend-ready-timeout to wait forever, "
+                "or pass --backend-ready-timeout-action proxy to start proxying anyway.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 124
         await run_proxy(
             listen_host,
             listen_port,
@@ -493,7 +538,7 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
 
     rc = 0
     try:
-        asyncio.run(_serve())
+        rc = int(asyncio.run(_serve()))
     except KeyboardInterrupt:
         rc = 130
     except Exception as e:  # noqa: BLE001

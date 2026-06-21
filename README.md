@@ -140,6 +140,14 @@ gpulock serve 8000:8001 2,3 -- \
 That single line acquires the lock, starts the backend, runs the request-aware
 proxy, and cleans everything up on exit. (Run `gpulock service install` once on
 the host so the guard is active — see [the guard service](#the-guard-service).)
+By default, the proxy waits forever for the backend TCP port before it starts
+listening on the public port. This is intentional: large vLLM cold starts can
+spend hours loading weights, compiling kernels, autotuning, profiling KV cache,
+and capturing CUDA graphs. If you want a bounded wait, pass
+`--backend-ready-timeout-s <seconds>`; on timeout gpulock exits instead of
+serving 502s. Pass `--backend-ready-timeout-action proxy` only if you explicitly
+want the old best-effort behavior where the public proxy starts even while the
+backend is still unavailable.
 
 The spec is `[lhost:]<listen_port>:[bhost:]<backend_port>`. The host parts are
 optional and independent on either side: the listen host defaults to `0.0.0.0`
@@ -194,6 +202,9 @@ Add or replace blacklist entries with `--ignore [METHOD:]PATH` (repeatable),
 | `--ignore-reset` | off | Drop the built-in heartbeat blacklist |
 | `--timeout-s` | 1800 | Maximum time to wait for the write lock |
 | `--no-wait-gpu-idle` | off | Skip the GPU-idle precheck before taking the lock |
+| `--backend-ready-timeout-s` | forever | Maximum time to wait for the backend TCP port before starting the proxy |
+| `--no-backend-ready-timeout` | on | Explicitly wait forever for the backend TCP port |
+| `--backend-ready-timeout-action` | fail | What to do after a bounded backend wait times out: `fail` exits, `proxy` starts forwarding anyway |
 
 ## Using gpulock with AI agents
 
