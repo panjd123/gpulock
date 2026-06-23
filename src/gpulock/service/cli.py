@@ -75,7 +75,7 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "placeholder_mem_ratio": (_parse_mem_ratio, lambda: DEFAULT_PLACEHOLDER_MEM_RATIO),
 }
 _HANDY_IDLE_TIMEOUT = 315360000
-_CONFIG_PRESETS = ("handy",)
+_CONFIG_PRESETS = ("handy", "all", "default")
 
 
 def _validate_key(key: str) -> None:
@@ -256,6 +256,13 @@ def _handy_gpu_ids() -> list[int]:
     return ids[1:]
 
 
+def _all_gpu_ids() -> list[int]:
+    ids = sorted(set(gpu_indices()))
+    if not ids:
+        raise ValueError("no GPUs found via nvidia-smi")
+    return ids
+
+
 def _config_preset(args: argparse.Namespace) -> int:
     cfg = _load_cfg()
     if args.name == "handy":
@@ -265,7 +272,25 @@ def _config_preset(args: argparse.Namespace) -> int:
             warn(f"cannot apply preset {args.name!r}: {e}")
             return 2
         cfg.idle_timeout = _HANDY_IDLE_TIMEOUT
+        cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
+        cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
         cfg.placeholder_mem_ratio = 0.0
+    elif args.name == "all":
+        try:
+            cfg.gpu_ids = _all_gpu_ids()
+        except ValueError as e:
+            warn(f"cannot apply preset {args.name!r}: {e}")
+            return 2
+        cfg.idle_timeout = _HANDY_IDLE_TIMEOUT
+        cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
+        cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
+        cfg.placeholder_mem_ratio = 0.0
+    elif args.name == "default":
+        cfg.gpu_ids = []
+        cfg.idle_timeout = DEFAULT_IDLE_TIMEOUT
+        cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
+        cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
+        cfg.placeholder_mem_ratio = DEFAULT_PLACEHOLDER_MEM_RATIO
     else:
         warn(f"unknown preset {args.name!r}; presets: {', '.join(_CONFIG_PRESETS)}")
         return 2

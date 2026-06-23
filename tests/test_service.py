@@ -187,7 +187,11 @@ def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cl
     cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
 
     service_dir = lock_root / "service"
-    proc = run_cli(["service", "install", "--no-start"])
+    proc = run_cli([
+        "service", "install", "--no-start",
+        "--placeholder-idle-s", "5.0",
+        "--guard-poll-s", "1.0",
+    ])
     assert proc.returncode == 0, proc.stderr
 
     proc = run_cli(["service", "config", "preset", "handy"])
@@ -198,6 +202,8 @@ def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cl
     saved_cfg = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg["gpu_ids"] == [1, 2]
     assert saved_cfg["idle_timeout"] == 315360000
+    assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
+    assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert saved_cfg["placeholder_mem_ratio"] == 0.0
 
 
@@ -249,6 +255,112 @@ def test_service_config_preset_handy_fails_without_detected_gpus(
 
     saved_cfg = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg["gpu_ids"] == [4]
+
+
+def test_service_config_preset_all_selects_all_gpus(run_cli, lock_root, cli_env, tmp_path):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "printf '0\\n1\\n2\\n'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli([
+        "service", "install", "--no-start",
+        "--placeholder-idle-s", "5.0",
+        "--guard-poll-s", "1.0",
+    ])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "all"])
+    assert proc.returncode == 0, proc.stderr
+    assert "applied preset all" in proc.stdout
+    assert "service restart" in proc.stdout
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [0, 1, 2]
+    assert saved_cfg["idle_timeout"] == 315360000
+    assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
+    assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
+    assert saved_cfg["placeholder_mem_ratio"] == 0.0
+
+
+def test_service_config_preset_all_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "printf '0\\n'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "9"])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "all"])
+    assert proc.returncode == 0, proc.stderr
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [0]
+    assert saved_cfg["idle_timeout"] == 315360000
+    assert saved_cfg["placeholder_mem_ratio"] == 0.0
+
+
+def test_service_config_preset_all_fails_without_detected_gpus(
+    run_cli,
+    lock_root,
+    cli_env,
+    tmp_path,
+):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    cli_env["PATH"] = f"{tmp_path}{os.pathsep}{cli_env.get('PATH', '')}"
+
+    service_dir = lock_root / "service"
+    proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "4"])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "all"])
+    assert proc.returncode == 2
+    assert "no GPUs found" in proc.stderr
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == [4]
+
+
+def test_service_config_preset_default_restores_defaults(run_cli, lock_root):
+    service_dir = lock_root / "service"
+    proc = run_cli([
+        "service", "install", "--no-start",
+        "--gpu-ids", "1,3",
+        "--idle-timeout", "9999",
+        "--placeholder-idle-s", "5.0",
+        "--guard-poll-s", "1.0",
+        "--placeholder-mem-ratio", "0.5",
+    ])
+    assert proc.returncode == 0, proc.stderr
+
+    proc = run_cli(["service", "config", "preset", "default"])
+    assert proc.returncode == 0, proc.stderr
+    assert "applied preset default" in proc.stdout
+    assert "service restart" in proc.stdout
+
+    saved_cfg = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg["gpu_ids"] == []
+    assert saved_cfg["idle_timeout"] == DEFAULT_IDLE_TIMEOUT
+    assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
+    assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
+    assert saved_cfg["placeholder_mem_ratio"] == DEFAULT_PLACEHOLDER_MEM_RATIO
 
 
 def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):
