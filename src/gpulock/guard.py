@@ -419,6 +419,21 @@ def cmd_guard(argv: list[str]) -> int:
 
     def gpu_status_snapshot(gid: int) -> dict[str, object]:
         gpu_dir = lock_root / f"gpu{gid}"
+        if is_serve_startup(gid):
+            # Minimal snapshot with no NVML queries: the GPU is deliberately
+            # kept clean for the starting backend, so don't poll it here either.
+            return {
+                "gpu_id": gid,
+                "placeholder": "not_running",
+                "placeholder_pid": None,
+                "dormant": gid in dormant,
+                "our_activity": False,
+                "serve_managed": is_serve_managed(gid),
+                "serve_startup": True,
+                "serve_busy": has_serve_signal(gid),
+                "runtime": None,
+                "reason": "released: serve backend starting up (placeholder fully stopped to free GPU for autotuning)",
+            }
         proc = placeholders.get(gid)
         ph_alive = proc is not None and proc.poll() is None
         state = placeholder_state(gpu_dir, timeout_s=0.2) if ph_alive else None
@@ -600,6 +615,20 @@ def cmd_guard(argv: list[str]) -> int:
 
                 ingest_activity_pulse(gid)
                 now = time.time()
+
+                if is_serve_startup(gid):
+                    # Backend is starting up: keep this GPU completely clean.
+                    # Fully stop the placeholder (destroy its CUDA context) and
+                    # do NO NVML polling for this GPU — frequent NVML queries
+                    # (utilization/process scans) during the backend's
+                    # startup-time autotuning measurably stall it, on top of the
+                    # parked-context effect. We resume normal handling once the
+                    # serve.startup marker is cleared (backend ready).
+                    if gid in placeholders or placeholder_socket_path(gpu_dir).exists():
+                        fully_stop_placeholder_worker(gid, "serve backend starting up")
+                    idle_since.pop(gid, None)
+                    continue
+
                 user_gpu_pids = observe_user_gpu_activity(gid, now)
 
                 if gid in placeholders and placeholders[gid].poll() is not None:
@@ -649,15 +678,7 @@ def cmd_guard(argv: list[str]) -> int:
                 serve_busy = has_serve_signal(gid)
                 serve_managed = is_serve_managed(gid)
 
-                if is_serve_startup(gid):
-                    # Serve backend is still starting up: fully stop the
-                    # placeholder (destroy its CUDA context) so it cannot
-                    # interfere with startup-time autotuning, and do not respawn
-                    # until the backend is ready (marker cleared).
-                    if gid in placeholders or ph_alive:
-                        fully_stop_placeholder_worker(gid, "serve backend starting up")
-                    idle_since.pop(gid, None)
-                elif our_active and not serve_managed:
+                if our_active and not serve_managed:
                     record_gpulock_activity(conn, gid, time.time())
                     if ph_alive:
                         park_placeholder_worker(gid, "our process/lock detected")
@@ -718,6 +739,13 @@ def cmd_guard(argv: list[str]) -> int:
 
             conn.commit()
             write_status_snapshot()
-            time.sleep(args.guard_poll_s)
+            # While every watched GPU is in serve-startup the guard has nothing
+            # to do but wait for readiness. Back off the poll so we issue no GPU
+            # queries at all on the cards a backend is autotuning (serve.startup
+            # GPUs already skip NVML in the loop and the status snapshot).
+            if all(is_serve_startup(g) for g in args.gpu_ids):
+                time.sleep(max(args.guard_poll_s, 0.5))
+            else:
+                time.sleep(args.guard_poll_s)
     finally:
         cleanup()
