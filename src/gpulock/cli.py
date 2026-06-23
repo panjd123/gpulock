@@ -80,6 +80,14 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean-ish environment variable, falling back to ``default``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _normalize_command(raw: list[str]) -> str:
     if not raw:
         raise ValueError(
@@ -371,6 +379,19 @@ def _parse_serve_proxy_args(argv: list[str]) -> argparse.Namespace:
         help="idle debounce before clearing serve.busy (default 50ms).",
     )
     parser.add_argument(
+        "--park-placeholder-until-ready",
+        action=argparse.BooleanOptionalAction,
+        default=_env_flag("GPULOCK_SERVE_PARK_UNTIL_READY", True),
+        help=(
+            "Keep the placeholder parked (assert serve.busy) from launch until "
+            "the backend becomes ready, so backend compilation/warmup/autotuning "
+            "is never disturbed by the placeholder competing for the GPU. After "
+            "the backend is ready, the placeholder is request-driven: parked "
+            "while requests are in flight, active (compute-only) when idle. "
+            "Enabled by default; env GPULOCK_SERVE_PARK_UNTIL_READY=0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--ignore", action="append", default=[], metavar="[METHOD:]PATH",
         help="extra request path to treat as a heartbeat (never triggers active). "
              "Repeat to add more; also reads GPULOCK_SERVE_IGNORE env.",
@@ -455,6 +476,17 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
 
     session.register_process_cleanup()
     _set_serve_managed(gpu_ids)
+    if args.park_placeholder_until_ready:
+        # Assert serve.busy immediately so the guard keeps the placeholder
+        # parked while the backend compiles/warms up/autotunes. Without this the
+        # guard would see serve.managed with no in-flight requests and activate
+        # the placeholder, stealing SM/VRAM from the backend's startup work
+        # (e.g. FlashInfer MoE autotuning). Released once the backend is ready.
+        _touch_serve_signal(gpu_ids)
+        log.info(
+            "serve: holding placeholder parked (serve.busy asserted) until backend ready gpus=%s",
+            gpu_ids_str,
+        )
     print(
         f"[GPU Lock] acquired mode=serve devices={gpu_ids_str} "
         f"proxy={listen_host}:{listen_port}->{backend_host}:{backend_port} "
@@ -507,7 +539,25 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
         backend_ready_timeout_s = None
         if not args.no_backend_ready_timeout and args.backend_ready_timeout_s is not None:
             backend_ready_timeout_s = max(float(args.backend_ready_timeout_s), 0.0)
-        ready = await _wait_backend_ready(backend_url, timeout_s=backend_ready_timeout_s)
+        # Race readiness against stop_event so a backend that crashes mid-startup
+        # (or a SIGTERM during a long compile) does not hang here forever while
+        # holding the write lock + serve.busy.
+        ready_task = asyncio.ensure_future(
+            _wait_backend_ready(backend_url, timeout_s=backend_ready_timeout_s)
+        )
+        stop_task = asyncio.ensure_future(stop_event.wait())
+        await asyncio.wait({ready_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if ready_task.done():
+            ready = ready_task.result()
+        else:
+            ready_task.cancel()
+            with __import__("contextlib").suppress(asyncio.CancelledError):
+                await ready_task
+            ready = False
+        if stop_event.is_set():
+            # Backend exited or we were asked to stop before becoming ready.
+            log.info("serve: stop requested before backend ready gpus=%s", gpu_ids_str)
+            return 0
         if not ready and args.backend_ready_timeout_action == "fail":
             waited = (
                 "forever"
@@ -525,6 +575,15 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
                 flush=True,
             )
             return 124
+        if args.park_placeholder_until_ready:
+            # Backend is ready (or we're proxying anyway): hand control of the
+            # placeholder to the request counter (idle -> active compute-only,
+            # in-flight -> parked).
+            _clear_serve_signal(gpu_ids)
+            log.info(
+                "serve: backend ready, releasing startup hold; placeholder now request-driven gpus=%s",
+                gpu_ids_str,
+            )
         await run_proxy(
             listen_host,
             listen_port,

@@ -174,12 +174,33 @@ writes two files under the lock root:
 - `serve.managed` (for the lifetime of the server) tells the guard this GPU is
   serve-owned, so the proxy's own write lock does **not** force the placeholder
   to stay parked.
-- `serve.busy` is set when the first real request arrives and cleared (after a
-  short debounce) when the last one finishes.
+- `serve.busy` is asserted from launch and held until the backend becomes
+  ready (see below), then driven by traffic: set when a real request is in
+  flight and cleared (after a short debounce) when the last one finishes.
 
 The guard then drives the placeholder purely from `serve.busy`: **parked** while
 requests are in flight (the backend gets the whole GPU), **active**
 (compute-only) when idle so the card is not reclaimed by the cluster.
+
+**Placeholder is parked until the backend is ready.** By default
+(`--park-placeholder-until-ready`, env `GPULOCK_SERVE_PARK_UNTIL_READY`), serve
+asserts `serve.busy` the moment it starts — *before* the backend has compiled,
+warmed up, or autotuned — and only releases it once the backend port is
+reachable. This matters for backends that autotune on startup (e.g. vLLM +
+FlashInfer TRTLLM MoE: `trtllm_fp4_block_scale_moe` / `trtllm_bf16_moe`): if the
+placeholder were active during that window it would compete for SM/VRAM on the
+very cards the backend is profiling, badly slowing — or appearing to hang —
+the autotuning. With the hold in place the backend gets clean, idle GPUs for its
+entire startup, and the placeholder only begins its idle/active cycle once the
+server is actually serving. Pass `--no-park-placeholder-until-ready` (or set
+`GPULOCK_SERVE_PARK_UNTIL_READY=0`) to restore the old behavior where the
+placeholder may activate during startup.
+
+> **Note on tensor parallelism.** A multi-GPU backend (e.g. `--tensor-parallel-size
+> 4`) autotunes on **all** of its GPUs concurrently — there is no single "tuning
+> card". So the placeholder must be parked on every served card during startup;
+> partitioning gpulock onto a subset of the served cards does not avoid the
+> interference. The hold above does the right thing automatically.
 
 **Heartbeat blacklist.** Liveness/readiness/metadata probes never count as real
 activity, so a polling health check or model-list fetch will not keep the
@@ -198,6 +219,7 @@ Add or replace blacklist entries with `--ignore [METHOD:]PATH` (repeatable),
 | Serve flag | Default | Meaning |
 |---|---:|---|
 | `--debounce-ms` | 50 | Idle debounce before `serve.busy` is cleared |
+| `--park-placeholder-until-ready` / `--no-...` | on | Hold the placeholder parked (assert `serve.busy`) from launch until the backend is ready, so startup compile/warmup/autotune is not disturbed. Env: `GPULOCK_SERVE_PARK_UNTIL_READY` |
 | `--ignore` | — | Extra heartbeat path to ignore (`[METHOD:]PATH`, repeatable) |
 | `--ignore-reset` | off | Drop the built-in heartbeat blacklist |
 | `--timeout-s` | 1800 | Maximum time to wait for the write lock |

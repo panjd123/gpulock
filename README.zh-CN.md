@@ -146,11 +146,26 @@ gpulock serve 8000:8001 2,3 -- \
 
 - `serve.managed`（服务存活期间一直存在）告诉 guard 这张卡由 serve 托管，因此
   代理自己持有的写锁**不会**强制占位进程一直 park。
-- `serve.busy` 在第一个真实请求到达时置位，在最后一个请求结束（经过短暂防抖）
-  后清除。
+- `serve.busy` 自启动起就置位并一直保持，直到后端就绪（见下文）；就绪后改由流量
+  驱动：有真实请求在途时置位，最后一个请求结束（经过短暂防抖）后清除。
 
 guard 随后完全依据 `serve.busy` 来驱动占位进程：有请求在途时 **park**（后端
 独占整张卡），空闲时 **active**（仅占算力），避免显卡被集群回收。
+
+**后端就绪前占位进程保持 park。** 默认开启（`--park-placeholder-until-ready`，
+环境变量 `GPULOCK_SERVE_PARK_UNTIL_READY`）：serve 一启动就立即置位 `serve.busy`
+——此时后端还在编译 / warmup / autotune——直到后端端口可连通才释放。这对启动期
+会做 autotune 的后端尤其关键（例如 vLLM + FlashInfer TRTLLM MoE 的
+`trtllm_fp4_block_scale_moe` / `trtllm_bf16_moe`）：若此时占位进程是 active 的，
+它会在后端正在 profiling 的同一批卡上抢占 SM/显存，严重拖慢 autotune，甚至看起来
+像卡死。有了这个 hold，后端整个启动过程都能拿到干净的空闲卡，占位进程只在服务
+真正就绪后才开始 idle/active 循环。传 `--no-park-placeholder-until-ready`（或设
+`GPULOCK_SERVE_PARK_UNTIL_READY=0`）可恢复旧行为（启动期允许占位进程 active）。
+
+> **关于张量并行。** 多卡后端（如 `--tensor-parallel-size 4`）会在它所有 GPU 上
+> **并行** autotune——不存在某张“专门 tuning 的卡”。因此启动期必须 park 服务所用
+> 的每一张卡；把 gpulock 只放到其中一部分卡上并不能避免干扰。上面的 hold 会自动
+> 处理好这一点。
 
 **心跳黑名单。** 存活/就绪/元信息探测请求绝不会被算作真实活动，因此轮询健康
 检查或拉取模型列表不会让占位进程一直 park。默认黑名单包含 `GET` 的
@@ -167,6 +182,7 @@ guard 随后完全依据 `serve.busy` 来驱动占位进程：有请求在途时
 | serve 参数 | 默认值 | 含义 |
 |---|---:|---|
 | `--debounce-ms` | 50 | 清除 `serve.busy` 前的空闲防抖时间 |
+| `--park-placeholder-until-ready` / `--no-...` | 开启 | 从启动到后端就绪期间保持占位进程 park（置位 `serve.busy`），避免干扰启动期的编译 / warmup / autotune。环境变量：`GPULOCK_SERVE_PARK_UNTIL_READY` |
 | `--ignore` | — | 额外的心跳路径（`[METHOD:]PATH`，可重复） |
 | `--ignore-reset` | 关闭 | 丢弃内置心跳黑名单 |
 | `--timeout-s` | 1800 | 等待写锁的最长时间 |
