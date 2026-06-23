@@ -296,6 +296,35 @@ def cmd_guard(argv: list[str]) -> int:
         kill_visible_placeholder_compute_pids(gid)
         log.warning("gpu%d: placeholder park failed, killed worker (%s)", gid, reason)
 
+    def fully_stop_placeholder_worker(gid: int, reason: str) -> None:
+        """Terminate the placeholder worker so its CUDA context is destroyed.
+
+        Unlike park (which keeps the process and its resident CUDA context
+        alive), this fully releases the GPU: the process exits and its context
+        is gone. Used while a serve backend is starting up so the placeholder
+        cannot interfere with startup-time autotuning. The guard will respawn a
+        placeholder later via the normal idle/serve-idle paths.
+        """
+        gpu_dir = lock_root / f"gpu{gid}"
+        proc = placeholders.get(gid)
+        stopped = stop_placeholder(gpu_dir, timeout_s=5.0)
+        if proc is not None:
+            if proc.poll() is None and not stopped:
+                with contextlib.suppress(Exception):
+                    proc.terminate()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+        placeholders.pop(gid, None)
+        placeholder_started_at.pop(gid, None)
+        placeholder_compute_pids_by_gpu.pop(gid, None)
+        placeholder_active.discard(gid)
+        (gpu_dir / "placeholder.pid").unlink(missing_ok=True)
+        placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
+        log.info("gpu%d: fully stopped placeholder (%s)", gid, reason)
+
     def activate_placeholder_worker(gid: int, reason: str) -> None:
         if gid in placeholder_active:
             return
@@ -344,6 +373,22 @@ def cmd_guard(argv: list[str]) -> int:
     def is_serve_managed(gid: int) -> bool:
         """Check if a serve reverse proxy currently owns this GPU."""
         return serve_managed_file(gid).exists()
+
+    def serve_startup_file(gid: int) -> Path:
+        """Path to the serve-startup marker file for a GPU.
+
+        When this file exists, a ``gpulock serve`` backend on this GPU is still
+        starting up (load/compile/warmup/autotune) and is not yet ready. The
+        guard responds by fully **stopping** the placeholder (destroying its
+        CUDA context), not just parking it, because a resident second context
+        serializes the backend's startup-time autotuning and slows it
+        several-fold. The placeholder is not respawned until the marker clears.
+        """
+        return lock_root / f"gpu{gid}" / "serve.startup"
+
+    def is_serve_startup(gid: int) -> bool:
+        """Check if a serve backend on this GPU is still starting up."""
+        return serve_startup_file(gid).exists()
 
     def gpu_is_idle_for_placeholder(gid: int) -> bool:
         """Check if placeholder may activate on this GPU.
@@ -402,7 +447,10 @@ def cmd_guard(argv: list[str]) -> int:
         reason = "placeholder active"
         serve_busy = has_serve_signal(gid)
         serve_managed = is_serve_managed(gid)
-        if not ph_alive and gid in placeholder_fail_reported:
+        serve_startup = is_serve_startup(gid)
+        if serve_startup:
+            reason = "released: serve backend starting up (placeholder fully stopped to free GPU for autotuning)"
+        elif not ph_alive and gid in placeholder_fail_reported:
             reason = "placeholder worker failed to start; see guard log"
         elif gid in dormant:
             reason = f"dormant: no user GPU activity for {args.idle_timeout}s"
@@ -455,6 +503,7 @@ def cmd_guard(argv: list[str]) -> int:
             "dormant": gid in dormant,
             "our_activity": our_active,
             "serve_managed": serve_managed,
+            "serve_startup": serve_startup,
             "serve_busy": serve_busy,
             "recent_pulse": recent_pulse,
             "idle_for_s": max(now - idle_since[gid], 0.0) if gid in idle_since else None,
@@ -513,6 +562,10 @@ def cmd_guard(argv: list[str]) -> int:
     for gid in args.gpu_ids:
         record_gpulock_activity(conn, gid, startup_ts)
         observe_user_gpu_activity(gid, startup_ts)
+        # Do not spawn a placeholder on a GPU whose serve backend is still
+        # starting up: it must stay free of any second CUDA context.
+        if is_serve_startup(gid):
+            continue
         ensure_placeholder_worker(gid)
         if should_exit_for_placeholder_failures:
             cleanup()
@@ -527,6 +580,8 @@ def cmd_guard(argv: list[str]) -> int:
     )
     for gid in args.gpu_ids:
         if gpu_has_our_activity(lock_root, gid):
+            continue
+        if is_serve_startup(gid):
             continue
         # Activate placeholder if GPU is idle for placeholder at startup.
         if gpu_is_idle_for_placeholder(gid):
@@ -594,7 +649,15 @@ def cmd_guard(argv: list[str]) -> int:
                 serve_busy = has_serve_signal(gid)
                 serve_managed = is_serve_managed(gid)
 
-                if our_active and not serve_managed:
+                if is_serve_startup(gid):
+                    # Serve backend is still starting up: fully stop the
+                    # placeholder (destroy its CUDA context) so it cannot
+                    # interfere with startup-time autotuning, and do not respawn
+                    # until the backend is ready (marker cleared).
+                    if gid in placeholders or ph_alive:
+                        fully_stop_placeholder_worker(gid, "serve backend starting up")
+                    idle_since.pop(gid, None)
+                elif our_active and not serve_managed:
                     record_gpulock_activity(conn, gid, time.time())
                     if ph_alive:
                         park_placeholder_worker(gid, "our process/lock detected")

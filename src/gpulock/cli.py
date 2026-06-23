@@ -280,6 +280,35 @@ def _clear_serve_managed(gpu_ids: list[int]) -> None:
         path.unlink(missing_ok=True)
 
 
+def _get_serve_startup_paths(gpu_ids: list[int]) -> list[Path]:
+    """Return the paths to serve-startup marker files for the given GPU IDs.
+
+    While this marker exists, a ``gpulock serve`` backend is still starting up
+    (loading, compiling, warming up, autotuning) and is *not* yet ready. The
+    guard responds by **fully stopping** the placeholder on that GPU — not just
+    parking it — so the placeholder's CUDA context is destroyed and cannot
+    interfere with the backend's startup-time work (e.g. FlashInfer MoE
+    autotuning, whose precise timing is serialized by any second resident
+    context on the device). The marker is removed once the backend is ready.
+    """
+    lock_root = resolve_lock_root()
+    return [lock_root / f"gpu{gid}" / "serve.startup" for gid in gpu_ids]
+
+
+def _set_serve_startup(gpu_ids: list[int]) -> None:
+    """Mark GPUs as hosting a serve backend that is still starting up."""
+    import time
+    for path in _get_serve_startup_paths(gpu_ids):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"pid={os.getpid()} ts={time.time()}\n")
+
+
+def _clear_serve_startup(gpu_ids: list[int]) -> None:
+    """Remove serve-startup marker files (backend is ready)."""
+    for path in _get_serve_startup_paths(gpu_ids):
+        path.unlink(missing_ok=True)
+
+
 def _run_serve_command(args: argparse.Namespace) -> int:
     """Run a command in serve mode: write lock + signal file coordination.
 
@@ -477,14 +506,17 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
     session.register_process_cleanup()
     _set_serve_managed(gpu_ids)
     if args.park_placeholder_until_ready:
-        # Assert serve.busy immediately so the guard keeps the placeholder
-        # parked while the backend compiles/warms up/autotunes. Without this the
-        # guard would see serve.managed with no in-flight requests and activate
-        # the placeholder, stealing SM/VRAM from the backend's startup work
-        # (e.g. FlashInfer MoE autotuning). Released once the backend is ready.
+        # Until the backend is ready, tell the guard to FULLY STOP the
+        # placeholder on these GPUs (serve.startup), not just park it: a parked
+        # placeholder keeps its CUDA context resident, which serializes the
+        # backend's startup-time autotuning (e.g. FlashInfer MoE) and slows it
+        # several-fold. serve.busy is also asserted as a fallback so an older
+        # guard that doesn't understand serve.startup at least parks. Both are
+        # cleared once the backend is ready.
+        _set_serve_startup(gpu_ids)
         _touch_serve_signal(gpu_ids)
         log.info(
-            "serve: holding placeholder parked (serve.busy asserted) until backend ready gpus=%s",
+            "serve: holding placeholder stopped (serve.startup) until backend ready gpus=%s",
             gpu_ids_str,
         )
     print(
@@ -576,9 +608,11 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
             )
             return 124
         if args.park_placeholder_until_ready:
-            # Backend is ready (or we're proxying anyway): hand control of the
-            # placeholder to the request counter (idle -> active compute-only,
-            # in-flight -> parked).
+            # Backend is ready (or we're proxying anyway): drop the startup hold
+            # so the guard may bring the placeholder back, and hand control to
+            # the request counter (idle -> active compute-only, in-flight ->
+            # parked).
+            _clear_serve_startup(gpu_ids)
             _clear_serve_signal(gpu_ids)
             log.info(
                 "serve: backend ready, releasing startup hold; placeholder now request-driven gpus=%s",
@@ -614,6 +648,7 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
         backend_rc = backend_proc.returncode
         if backend_rc is not None and backend_rc != 0 and rc == 0:
             rc = backend_rc
+        _clear_serve_startup(gpu_ids)
         _clear_serve_signal(gpu_ids)
         _clear_serve_managed(gpu_ids)
         session.release()

@@ -209,6 +209,7 @@ def test_serve_busy_asserted_until_backend_ready(run_cli, lock_root: Path):
     gpu_dir = lock_root / f"gpu{gpu_id}"
     managed = gpu_dir / "serve.managed"
     busy = gpu_dir / "serve.busy"
+    startup = gpu_dir / "serve.startup"
 
     env = {
         **__import__("os").environ,
@@ -240,19 +241,22 @@ def test_serve_busy_asserted_until_backend_ready(run_cli, lock_root: Path):
             time.sleep(0.05)
         assert managed.exists(), "serve.managed should be created"
         assert busy.exists(), "serve.busy must be asserted before backend ready"
+        assert startup.exists(), "serve.startup must be set before backend ready"
 
         # It must STAY asserted while the backend stays down.
         time.sleep(1.0)
         assert busy.exists(), "serve.busy must remain while backend is not ready"
+        assert startup.exists(), "serve.startup must remain while backend is not ready"
 
         # Now bring the backend up; the hold must be released after readiness.
         server = ThreadingHTTPServer(("127.0.0.1", backend_port), _Handler)
         Thread(target=server.serve_forever, daemon=True).start()
 
         deadline = time.time() + 15
-        while time.time() < deadline and busy.exists():
+        while time.time() < deadline and (busy.exists() or startup.exists()):
             time.sleep(0.05)
         assert not busy.exists(), "serve.busy must clear once backend is ready"
+        assert not startup.exists(), "serve.startup must clear once backend is ready"
     finally:
         proc.terminate()
         try:

@@ -182,19 +182,31 @@ The guard then drives the placeholder purely from `serve.busy`: **parked** while
 requests are in flight (the backend gets the whole GPU), **active**
 (compute-only) when idle so the card is not reclaimed by the cluster.
 
-**Placeholder is parked until the backend is ready.** By default
+**Placeholder is fully stopped until the backend is ready.** By default
 (`--park-placeholder-until-ready`, env `GPULOCK_SERVE_PARK_UNTIL_READY`), serve
-asserts `serve.busy` the moment it starts — *before* the backend has compiled,
-warmed up, or autotuned — and only releases it once the backend port is
-reachable. This matters for backends that autotune on startup (e.g. vLLM +
-FlashInfer TRTLLM MoE: `trtllm_fp4_block_scale_moe` / `trtllm_bf16_moe`): if the
-placeholder were active during that window it would compete for SM/VRAM on the
-very cards the backend is profiling, badly slowing — or appearing to hang —
-the autotuning. With the hold in place the backend gets clean, idle GPUs for its
-entire startup, and the placeholder only begins its idle/active cycle once the
-server is actually serving. Pass `--no-park-placeholder-until-ready` (or set
-`GPULOCK_SERVE_PARK_UNTIL_READY=0`) to restore the old behavior where the
-placeholder may activate during startup.
+writes a `serve.startup` marker the moment it starts — *before* the backend has
+compiled, warmed up, or autotuned — and removes it only once the backend port is
+reachable. While that marker is present the guard **fully stops** the
+placeholder on those GPUs (terminates the worker so its CUDA context is
+destroyed), and does not respawn it until the backend is ready.
+
+This is stronger than parking on purpose. A *parked* placeholder stops computing
+but keeps its process and **CUDA context resident** on the device; that second
+context is enough to serialize a backend's startup-time autotuning. Concretely,
+vLLM + FlashInfer TRTLLM MoE autotuning (`trtllm_fp4_block_scale_moe` /
+`trtllm_bf16_moe`) profiles candidate kernels with precise per-kernel timing and
+device synchronization — a resident parked context measured **~3-7x slower per
+profile** (≈65-75s vs ≈11-18s) even at near-0% GPU utilization. Fully stopping
+the placeholder gives the backend completely clean GPUs for its entire startup,
+then the placeholder returns to its normal idle→active / in-flight→park cycle
+once the server is serving. Pass `--no-park-placeholder-until-ready` (or set
+`GPULOCK_SERVE_PARK_UNTIL_READY=0`) to disable and let the placeholder run during
+startup.
+
+> The cost of the hold is that the GPUs carry no placeholder during the
+> (potentially long) startup, so a reclaim-prone cluster could take the box
+> back mid-startup. That is the intended trade-off: clean, fast autotuning over
+> anti-reclaim coverage during a one-time startup.
 
 > **Note on tensor parallelism.** A multi-GPU backend (e.g. `--tensor-parallel-size
 > 4`) autotunes on **all** of its GPUs concurrently — there is no single "tuning
@@ -219,7 +231,7 @@ Add or replace blacklist entries with `--ignore [METHOD:]PATH` (repeatable),
 | Serve flag | Default | Meaning |
 |---|---:|---|
 | `--debounce-ms` | 50 | Idle debounce before `serve.busy` is cleared |
-| `--park-placeholder-until-ready` / `--no-...` | on | Hold the placeholder parked (assert `serve.busy`) from launch until the backend is ready, so startup compile/warmup/autotune is not disturbed. Env: `GPULOCK_SERVE_PARK_UNTIL_READY` |
+| `--park-placeholder-until-ready` / `--no-...` | on | Fully stop the placeholder (release its CUDA context via `serve.startup`) from launch until the backend is ready, so startup compile/warmup/autotune runs on clean GPUs. Env: `GPULOCK_SERVE_PARK_UNTIL_READY` |
 | `--ignore` | — | Extra heartbeat path to ignore (`[METHOD:]PATH`, repeatable) |
 | `--ignore-reset` | off | Drop the built-in heartbeat blacklist |
 | `--timeout-s` | 1800 | Maximum time to wait for the write lock |

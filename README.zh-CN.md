@@ -152,15 +152,24 @@ gpulock serve 8000:8001 2,3 -- \
 guard 随后完全依据 `serve.busy` 来驱动占位进程：有请求在途时 **park**（后端
 独占整张卡），空闲时 **active**（仅占算力），避免显卡被集群回收。
 
-**后端就绪前占位进程保持 park。** 默认开启（`--park-placeholder-until-ready`，
-环境变量 `GPULOCK_SERVE_PARK_UNTIL_READY`）：serve 一启动就立即置位 `serve.busy`
-——此时后端还在编译 / warmup / autotune——直到后端端口可连通才释放。这对启动期
-会做 autotune 的后端尤其关键（例如 vLLM + FlashInfer TRTLLM MoE 的
-`trtllm_fp4_block_scale_moe` / `trtllm_bf16_moe`）：若此时占位进程是 active 的，
-它会在后端正在 profiling 的同一批卡上抢占 SM/显存，严重拖慢 autotune，甚至看起来
-像卡死。有了这个 hold，后端整个启动过程都能拿到干净的空闲卡，占位进程只在服务
-真正就绪后才开始 idle/active 循环。传 `--no-park-placeholder-until-ready`（或设
-`GPULOCK_SERVE_PARK_UNTIL_READY=0`）可恢复旧行为（启动期允许占位进程 active）。
+**后端就绪前占位进程被完全停掉。** 默认开启（`--park-placeholder-until-ready`，
+环境变量 `GPULOCK_SERVE_PARK_UNTIL_READY`）：serve 一启动就写下 `serve.startup`
+标记——此时后端还在编译 / warmup / autotune——直到后端端口可连通才移除。标记存在
+期间，guard 会把这些卡上的占位进程**完全停掉**（终止 worker 进程、销毁其 CUDA
+context），并且在后端就绪前不重新拉起。
+
+这比单纯 park 更彻底，是有意为之。**park 只是停止计算，进程和它的 CUDA context
+仍然驻留在卡上**；而这个驻留的第二 context 足以让后端启动期的 autotune 被串行化。
+实测 vLLM + FlashInfer TRTLLM MoE 的 autotune（`trtllm_fp4_block_scale_moe` /
+`trtllm_bf16_moe`）按 kernel 精确计时 + 设备同步，在有一个 parked context 驻留时
+**每个 profile 慢约 3-7 倍**（≈65-75s vs ≈11-18s），即便此时 GPU 利用率接近 0%。
+完全停掉占位进程后，后端整个启动期都能拿到完全干净的卡；服务就绪后占位进程再回到
+正常的 idle→active / 有请求→park 循环。传 `--no-park-placeholder-until-ready`（或设
+`GPULOCK_SERVE_PARK_UNTIL_READY=0`）可关闭此行为（启动期允许占位进程运行）。
+
+> 代价是：在（可能很长的）启动期内这些卡上没有占位进程，易被回收的集群可能在启动
+> 中途把机器收走。这是**有意的取舍**：用「一次性启动期内放弃防回收」换「干净、快速
+> 的 autotune」。
 
 > **关于张量并行。** 多卡后端（如 `--tensor-parallel-size 4`）会在它所有 GPU 上
 > **并行** autotune——不存在某张“专门 tuning 的卡”。因此启动期必须 park 服务所用
@@ -182,7 +191,7 @@ guard 随后完全依据 `serve.busy` 来驱动占位进程：有请求在途时
 | serve 参数 | 默认值 | 含义 |
 |---|---:|---|
 | `--debounce-ms` | 50 | 清除 `serve.busy` 前的空闲防抖时间 |
-| `--park-placeholder-until-ready` / `--no-...` | 开启 | 从启动到后端就绪期间保持占位进程 park（置位 `serve.busy`），避免干扰启动期的编译 / warmup / autotune。环境变量：`GPULOCK_SERVE_PARK_UNTIL_READY` |
+| `--park-placeholder-until-ready` / `--no-...` | 开启 | 从启动到后端就绪期间**完全停掉**占位进程（经 `serve.startup` 销毁其 CUDA context），让启动期的编译 / warmup / autotune 跑在干净的卡上。环境变量：`GPULOCK_SERVE_PARK_UNTIL_READY` |
 | `--ignore` | — | 额外的心跳路径（`[METHOD:]PATH`，可重复） |
 | `--ignore-reset` | 关闭 | 丢弃内置心跳黑名单 |
 | `--timeout-s` | 1800 | 等待写锁的最长时间 |
