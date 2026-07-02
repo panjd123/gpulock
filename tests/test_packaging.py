@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9/3.10
+    import tomli as tomllib
 
 from conftest import REPO
 
@@ -19,7 +22,10 @@ def test_pyproject_declares_current_entrypoint_and_dependencies():
     assert pyproject["project"]["scripts"] == {
         "gpulock": "gpulock.cli:main",
     }
-    assert pyproject["project"]["optional-dependencies"]["test"] == ["pytest>=8"]
+    assert pyproject["project"]["optional-dependencies"]["test"] == [
+        "pytest>=6.2",
+        "tomli>=2; python_version < '3.11'",
+    ]
 
 
 def test_install_script_is_not_part_of_the_project():
