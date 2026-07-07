@@ -149,11 +149,13 @@ def _run_locked_command(args: argparse.Namespace) -> int:
         " ".join(shlex.quote(x) for x in sys.argv),
     )
 
+    env_config = LockConfig.from_env()
     cfg = LockConfig(
         poll_ms=max(args.poll_ms, 1),
         timeout_s=max(args.timeout_s, 1),
         grace_age_s=max(args.grace_age_s, 1),
         heartbeat_s=max(args.heartbeat_s, 1),
+        placeholder_release_mode=env_config.placeholder_release_mode,
     )
     try:
         command = _normalize_command(args.command)
@@ -487,7 +489,11 @@ def _run_serve_proxy_command(argv: list[str]) -> int:
     else:
         rules = ignore_rules_from_env(args.ignore)
 
-    cfg = LockConfig(timeout_s=max(args.timeout_s, 1))
+    env_config = LockConfig.from_env()
+    cfg = LockConfig(
+        timeout_s=max(args.timeout_s, 1),
+        placeholder_release_mode=env_config.placeholder_release_mode,
+    )
     session = MultiGpuLock(
         gpu_ids=gpu_ids,
         mode=WRITE_MODE,

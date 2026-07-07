@@ -22,6 +22,7 @@ from .activity import (
     record_gpulock_event,
     record_user_gpu_activity,
 )
+from .config import PLACEHOLDER_RELEASE_PARK, PLACEHOLDER_RELEASE_STOP, normalize_placeholder_release_mode
 from .gpu import (
     gpu_compute_pids,
     gpu_indices,
@@ -46,6 +47,7 @@ from .service.common import (
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_PLACEHOLDER_IDLE_S,
     DEFAULT_PLACEHOLDER_MEM_RATIO,
+    DEFAULT_PLACEHOLDER_RELEASE_MODE,
     guard_status_path,
 )
 
@@ -145,8 +147,20 @@ def cmd_guard(argv: list[str]) -> int:
         "--placeholder-mem-ratio", type=float, default=DEFAULT_PLACEHOLDER_MEM_RATIO,
         help=f"fraction of GPU memory to allocate (0.0-1.0, 0 = compute-only, default {DEFAULT_PLACEHOLDER_MEM_RATIO})",
     )
+    parser.add_argument(
+        "--placeholder-release-mode",
+        default=DEFAULT_PLACEHOLDER_RELEASE_MODE,
+        choices=(PLACEHOLDER_RELEASE_STOP, PLACEHOLDER_RELEASE_PARK),
+        help=(
+            "how to release placeholders when real work is detected: "
+            "'stop' fully exits the placeholder and destroys its CUDA context "
+            "(clean, slower to restart; default), 'park' keeps the CUDA context "
+            "resident for faster reuse"
+        ),
+    )
     args = parser.parse_args(argv)
     args.guard_poll_s = max(float(args.guard_poll_s), 0.05)
+    args.placeholder_release_mode = normalize_placeholder_release_mode(args.placeholder_release_mode)
     args.gpu_ids = _resolve_guard_gpu_ids(args.gpu_ids)
     if not args.gpu_ids:
         print("[gpulock] could not enumerate visible GPUs for guard; pass GPU_ID explicitly", file=sys.stderr)
@@ -325,6 +339,12 @@ def cmd_guard(argv: list[str]) -> int:
         placeholder_socket_path(gpu_dir).unlink(missing_ok=True)
         log.info("gpu%d: fully stopped placeholder (%s)", gid, reason)
 
+    def release_placeholder_worker(gid: int, reason: str) -> None:
+        if args.placeholder_release_mode == PLACEHOLDER_RELEASE_PARK:
+            park_placeholder_worker(gid, reason)
+            return
+        fully_stop_placeholder_worker(gid, reason)
+
     def activate_placeholder_worker(gid: int, reason: str) -> None:
         if gid in placeholder_active:
             return
@@ -414,7 +434,9 @@ def cmd_guard(argv: list[str]) -> int:
             return True  # runtime unavailable, assume idle
         if not ext_pids:
             return True
-        # External PIDs exist — check if serve signal says we should park
+        if args.placeholder_release_mode == PLACEHOLDER_RELEASE_STOP:
+            return False
+        # Legacy park mode may activate next to external PIDs unless serve says busy.
         return not has_serve_signal(gid)
 
     def gpu_status_snapshot(gid: int) -> dict[str, object]:
@@ -543,6 +565,7 @@ def cmd_guard(argv: list[str]) -> int:
                 "placeholder_idle_s": args.placeholder_idle_s,
                 "guard_poll_s": args.guard_poll_s,
                 "placeholder_mem_ratio": args.placeholder_mem_ratio,
+                "placeholder_release_mode": args.placeholder_release_mode,
                 "gpus": [gpu_status_snapshot(gid) for gid in args.gpu_ids],
             },
         )
@@ -681,16 +704,16 @@ def cmd_guard(argv: list[str]) -> int:
                 if our_active and not serve_managed:
                     record_gpulock_activity(conn, gid, time.time())
                     if ph_alive:
-                        park_placeholder_worker(gid, "our process/lock detected")
+                        release_placeholder_worker(gid, "our process/lock detected")
                     idle_since.pop(gid, None)
                     if gid in dormant:
                         dormant.discard(gid)
                         log.info("gpu%d: woke from dormant (our activity detected)", gid)
                 elif serve_busy:
-                    # Serve process has active requests — keep placeholder parked.
+                    # Serve process has active requests — release placeholder.
                     # (Covers both serve-managed GPUs and the legacy hook flow.)
-                    if ph_alive and gid in placeholder_active:
-                        park_placeholder_worker(gid, "serve signal present")
+                    if ph_alive:
+                        release_placeholder_worker(gid, "serve signal present")
                     idle_since.pop(gid, None)
                     if gid in dormant:
                         dormant.discard(gid)
@@ -707,8 +730,8 @@ def cmd_guard(argv: list[str]) -> int:
                     if gid in dormant:
                         dormant.discard(gid)
                 elif gid in dormant:
-                    if ph_alive and gid in placeholder_active:
-                        park_placeholder_worker(gid, "dormant")
+                    if ph_alive and (gid in placeholder_active or args.placeholder_release_mode == PLACEHOLDER_RELEASE_STOP):
+                        release_placeholder_worker(gid, "dormant")
                 else:
                     if gid not in idle_since:
                         idle_since[gid] = now
@@ -718,7 +741,10 @@ def cmd_guard(argv: list[str]) -> int:
                         # Activate placeholder if GPU is idle for it:
                         # no lock activity, and either no external PIDs
                         # or external PIDs exist but no serve signal.
-                        if gpu_is_idle_for_placeholder(gid):
+                        if user_gpu_pids and ph_alive and args.placeholder_release_mode == PLACEHOLDER_RELEASE_STOP:
+                            release_placeholder_worker(gid, "user GPU process detected")
+                            idle_since[gid] = now
+                        elif gpu_is_idle_for_placeholder(gid):
                             activate_placeholder_worker(gid, "gpu idle")
                             if should_exit_for_placeholder_failures:
                                 cleanup()
@@ -732,7 +758,7 @@ def cmd_guard(argv: list[str]) -> int:
                         and gid in placeholder_active
                         and not has_recent_user_idle_activity(conn, gid, args.idle_timeout, now=now)
                     ):
-                        park_placeholder_worker(gid, f"no user activity for {args.idle_timeout}s")
+                        release_placeholder_worker(gid, f"no user activity for {args.idle_timeout}s")
                         dormant.add(gid)
                         idle_since.pop(gid, None)
                         log.info("gpu%d: dormant (no user activity for %ds)", gid, args.idle_timeout)

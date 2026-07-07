@@ -10,6 +10,11 @@ import sys
 from typing import Any, Callable
 
 from ..gpu import gpu_indices
+from ..config import (
+    DEFAULT_PLACEHOLDER_RELEASE_MODE,
+    PLACEHOLDER_RELEASE_MODES,
+    normalize_placeholder_release_mode,
+)
 from . import supervisor as supervisor_backend
 from .common import (
     DEFAULT_GUARD_POLL_S,
@@ -73,6 +78,7 @@ _CONFIG_KEYS: dict[str, tuple[Callable[[str], Any], Callable[[], Any]]] = {
     "placeholder_idle_s": (float, lambda: DEFAULT_PLACEHOLDER_IDLE_S),
     "guard_poll_s": (float, lambda: DEFAULT_GUARD_POLL_S),
     "placeholder_mem_ratio": (_parse_mem_ratio, lambda: DEFAULT_PLACEHOLDER_MEM_RATIO),
+    "placeholder_release_mode": (normalize_placeholder_release_mode, lambda: DEFAULT_PLACEHOLDER_RELEASE_MODE),
 }
 _HANDY_IDLE_TIMEOUT = 315360000
 _CONFIG_PRESETS = ("handy", "all", "default")
@@ -128,6 +134,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--placeholder-mem-ratio", type=float, default=DEFAULT_PLACEHOLDER_MEM_RATIO,
                            help="fraction of GPU memory to allocate (0.0-1.0, 0 = compute-only)")
     p_install.add_argument(
+        "--placeholder-release-mode",
+        default=DEFAULT_PLACEHOLDER_RELEASE_MODE,
+        choices=PLACEHOLDER_RELEASE_MODES,
+        help=(
+            "placeholder release behavior when real work is detected: "
+            "stop = destroy CUDA context before work (clean, slower restart; default), "
+            "park = legacy fast mode with resident CUDA context"
+        ),
+    )
+    p_install.add_argument(
         "--env", action="append", default=[], metavar="KEY=VALUE",
         help="extra environment variable to inject into the guard (repeat to add more)",
     )
@@ -177,6 +193,7 @@ def _do_install(args: argparse.Namespace) -> int:
             placeholder_idle_s=float(args.placeholder_idle_s),
             guard_poll_s=float(args.guard_poll_s),
             placeholder_mem_ratio=_parse_mem_ratio(str(args.placeholder_mem_ratio)),
+            placeholder_release_mode=normalize_placeholder_release_mode(args.placeholder_release_mode),
             extra_env=_parse_env_kv(list(args.env)),
             python_executable=sys.executable or "",
             gpulock_executable=shutil.which("gpulock") or "",
@@ -275,6 +292,7 @@ def _config_preset(args: argparse.Namespace) -> int:
         cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
         cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
         cfg.placeholder_mem_ratio = 0.0
+        cfg.placeholder_release_mode = DEFAULT_PLACEHOLDER_RELEASE_MODE
     elif args.name == "all":
         try:
             cfg.gpu_ids = _all_gpu_ids()
@@ -285,12 +303,14 @@ def _config_preset(args: argparse.Namespace) -> int:
         cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
         cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
         cfg.placeholder_mem_ratio = 0.0
+        cfg.placeholder_release_mode = DEFAULT_PLACEHOLDER_RELEASE_MODE
     elif args.name == "default":
         cfg.gpu_ids = []
         cfg.idle_timeout = DEFAULT_IDLE_TIMEOUT
         cfg.placeholder_idle_s = DEFAULT_PLACEHOLDER_IDLE_S
         cfg.guard_poll_s = DEFAULT_GUARD_POLL_S
         cfg.placeholder_mem_ratio = DEFAULT_PLACEHOLDER_MEM_RATIO
+        cfg.placeholder_release_mode = DEFAULT_PLACEHOLDER_RELEASE_MODE
     else:
         warn(f"unknown preset {args.name!r}; presets: {', '.join(_CONFIG_PRESETS)}")
         return 2
@@ -299,7 +319,8 @@ def _config_preset(args: argparse.Namespace) -> int:
         f"applied preset {args.name}: "
         f"gpu_ids={_format_value('gpu_ids', cfg.gpu_ids)} "
         f"idle_timeout={cfg.idle_timeout} "
-        f"placeholder_mem_ratio={cfg.placeholder_mem_ratio}"
+        f"placeholder_mem_ratio={cfg.placeholder_mem_ratio} "
+        f"placeholder_release_mode={cfg.placeholder_release_mode}"
     )
     say("apply with: gpulock service restart")
     return 0

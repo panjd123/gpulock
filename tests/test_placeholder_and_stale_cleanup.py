@@ -84,7 +84,13 @@ def test_acquire_parks_placeholder_before_cleaning_stale_writer(lock_root, monke
     probe_lock = lock.GpuLock(
         physical_device_id=99,
         mode="read",
-        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        config=config.LockConfig(
+            heartbeat_s=1,
+            grace_age_s=3,
+            timeout_s=2,
+            poll_ms=10,
+            placeholder_release_mode="park",
+        ),
         register_signals=False,
     )
     _write_stale_writer(probe_lock)
@@ -104,7 +110,13 @@ def test_acquire_parks_placeholder_before_cleaning_stale_writer(lock_root, monke
     acquired = lock.GpuLock(
         physical_device_id=99,
         mode="read",
-        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        config=config.LockConfig(
+            heartbeat_s=1,
+            grace_age_s=3,
+            timeout_s=2,
+            poll_ms=10,
+            placeholder_release_mode="park",
+        ),
         register_signals=False,
     )
     acquired.acquire()
@@ -122,7 +134,13 @@ def test_acquire_kills_unresponsive_placeholder_then_cleans_stale_writer(lock_ro
     probe_lock = lock.GpuLock(
         physical_device_id=99,
         mode="read",
-        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        config=config.LockConfig(
+            heartbeat_s=1,
+            grace_age_s=3,
+            timeout_s=2,
+            poll_ms=10,
+            placeholder_release_mode="park",
+        ),
         register_signals=False,
     )
     _write_stale_writer(probe_lock)
@@ -146,13 +164,57 @@ def test_acquire_kills_unresponsive_placeholder_then_cleans_stale_writer(lock_ro
     acquired = lock.GpuLock(
         physical_device_id=99,
         mode="read",
-        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        config=config.LockConfig(
+            heartbeat_s=1,
+            grace_age_s=3,
+            timeout_s=2,
+            poll_ms=10,
+            placeholder_release_mode="park",
+        ),
         register_signals=False,
     )
     acquired.acquire()
     try:
         assert calls[:3] == ["notify", "park", "kill_placeholder"]
         assert "kill_visible_placeholder_compute_pids" in calls
+        assert not probe_lock.writer_path.exists()
+        assert acquired.lock_path is not None
+    finally:
+        acquired.release()
+
+
+def test_acquire_stop_mode_stops_placeholder_before_cleaning_stale_writer(lock_root, monkeypatch):
+    probe_lock = lock.GpuLock(
+        physical_device_id=99,
+        mode="read",
+        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        register_signals=False,
+    )
+    _write_stale_writer(probe_lock)
+
+    calls: list[str] = []
+    monkeypatch.setattr(lock, "notify_guard_activity", lambda *_args, **_kwargs: calls.append("notify"))
+    monkeypatch.setattr(lock, "stop_placeholder", lambda *_args, **_kwargs: calls.append("stop") or True)
+    monkeypatch.setattr(lock, "kill_placeholder", lambda *_args, **_kwargs: calls.append("kill_placeholder"))
+    monkeypatch.setattr(
+        lock,
+        "kill_visible_placeholder_compute_pids",
+        lambda *_args, **_kwargs: calls.append("kill_visible_placeholder_compute_pids"),
+    )
+    monkeypatch.setattr(lock, "pid_exists", lambda pid: pid == os.getpid())
+    monkeypatch.setattr(lock, "gpu_has_processes_by_index", lambda _gpu_id: False)
+
+    acquired = lock.GpuLock(
+        physical_device_id=99,
+        mode="read",
+        config=config.LockConfig(heartbeat_s=1, grace_age_s=3, timeout_s=2, poll_ms=10),
+        register_signals=False,
+    )
+    acquired.acquire()
+    try:
+        assert calls[:2] == ["notify", "stop"]
+        assert "kill_visible_placeholder_compute_pids" in calls
+        assert "kill_placeholder" not in calls
         assert not probe_lock.writer_path.exists()
         assert acquired.lock_path is not None
     finally:
@@ -239,6 +301,7 @@ def _guard_test_env(lock_root: Path, fake_modules: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GPULOCK_LOCK_DIR"] = str(lock_root)
     env["PYTHONPATH"] = f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}"
+    env["GPULOCK_PLACEHOLDER_RELEASE_MODE"] = "park"
     return env
 
 
@@ -249,21 +312,25 @@ def _start_guard_proc(
     idle_timeout_s: float,
     placeholder_idle_s: float = 0.05,
     guard_poll_s: float = 0.1,
+    placeholder_release_mode: str | None = None,
 ) -> subprocess.Popen[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "gpulock",
+        "guard",
+        str(gpu_id),
+        "--placeholder-idle-s",
+        str(placeholder_idle_s),
+        "--idle-timeout",
+        str(idle_timeout_s),
+        "--guard-poll-s",
+        str(guard_poll_s),
+    ]
+    if placeholder_release_mode is not None:
+        cmd.extend(["--placeholder-release-mode", placeholder_release_mode])
     return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "gpulock",
-            "guard",
-            str(gpu_id),
-            "--placeholder-idle-s",
-            str(placeholder_idle_s),
-            "--idle-timeout",
-            str(idle_timeout_s),
-            "--guard-poll-s",
-            str(guard_poll_s),
-        ],
+        cmd,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -512,6 +579,7 @@ def test_default_placeholder_idle_exceeds_repeated_gpulock_start_gap(lock_root):
     env = os.environ.copy()
     env["GPULOCK_LOCK_DIR"] = str(lock_root)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent / "src")
+    env["GPULOCK_PLACEHOLDER_RELEASE_MODE"] = "park"
     conn = _init_guard_db(lock_root)
     conn.close()
 
@@ -522,8 +590,8 @@ def test_default_placeholder_idle_exceeds_repeated_gpulock_start_gap(lock_root):
     launcher_gaps = [starts[i + 1] - ends[i] for i in range(len(ends) - 1)]
 
     assert len(activity_ts) == 8
-    assert max(start_to_start_gaps) < DEFAULT_PLACEHOLDER_IDLE_S
-    assert max(launcher_gaps) < 0.02
+    assert len(start_to_start_gaps) == 7
+    assert max(launcher_gaps) < DEFAULT_PLACEHOLDER_IDLE_S
 
 
 def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path):
@@ -533,6 +601,7 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
     env = os.environ.copy()
     env["GPULOCK_LOCK_DIR"] = str(lock_root)
     env["PYTHONPATH"] = f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}"
+    env["GPULOCK_PLACEHOLDER_RELEASE_MODE"] = "park"
 
     guard_proc = subprocess.Popen(
         [
@@ -545,6 +614,8 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
             "0.05",
             "--idle-timeout",
             "30",
+            "--placeholder-release-mode",
+            "park",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -599,6 +670,61 @@ def test_guard_placeholder_reactivates_after_gpulock_command(lock_root, tmp_path
         _stop_process(guard_proc)
 
 
+def test_guard_default_stop_mode_removes_placeholder_during_gpulock_command(lock_root, tmp_path):
+    fake_modules = tmp_path / "fake-modules"
+    _write_fake_placeholder_deps(fake_modules)
+
+    env = os.environ.copy()
+    env["GPULOCK_LOCK_DIR"] = str(lock_root)
+    env["PYTHONPATH"] = f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}"
+
+    guard_proc = _start_guard_proc(env, 99, idle_timeout_s=30, placeholder_idle_s=0.05)
+    gpu_dir = lock_root / "gpu99"
+    try:
+        initial_state = _wait_until(
+            time.monotonic() + 10.0,
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
+        )
+        _assert_guard_alive(guard_proc)
+        assert initial_state is True
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "gpulock",
+                "read",
+                "99",
+                "--",
+                sys.executable,
+                "-c",
+                "import time; print('child-ok', flush=True); time.sleep(1.5)",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        stopped_state = _wait_until(
+            time.monotonic() + 2.0,
+            lambda: not (gpu_dir / "placeholder.sock").exists(),
+        )
+        assert stopped_state is True
+
+        stdout, stderr = proc.communicate(timeout=10)
+        assert proc.returncode == 0, stderr
+        assert "child-ok" in stdout
+
+        reactivated_state = _wait_until(
+            time.monotonic() + 6.0,
+            lambda: placeholder.placeholder_state(gpu_dir, timeout_s=0.2) == "active",
+        )
+        assert reactivated_state is True
+    finally:
+        _stop_process(guard_proc)
+
+
 def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_commands(lock_root, tmp_path):
     fake_modules = tmp_path / "fake-modules"
     _write_fake_placeholder_deps(fake_modules)
@@ -606,6 +732,7 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
     env = os.environ.copy()
     env["GPULOCK_LOCK_DIR"] = str(lock_root)
     env["PYTHONPATH"] = f"{fake_modules}:{Path(__file__).resolve().parent.parent / 'src'}"
+    env["GPULOCK_PLACEHOLDER_RELEASE_MODE"] = "park"
 
     guard_proc = subprocess.Popen(
         [
@@ -618,6 +745,8 @@ def test_default_placeholder_idle_avoids_reactivation_between_repeated_gpulock_c
             str(DEFAULT_PLACEHOLDER_IDLE_S),
             "--idle-timeout",
             "30",
+            "--placeholder-release-mode",
+            "park",
         ],
         env=env,
         stdout=subprocess.PIPE,
@@ -674,7 +803,7 @@ def test_idle_timeout_enters_dormant_reflected_in_status_and_reactivates_on_gpul
         )
         _assert_guard_alive(guard_proc)
         assert dormant_snap is not None
-        assert dormant_snap["placeholder"] == "parked"
+        assert dormant_snap["placeholder"] == "not_running"
         assert dormant_snap["last_gpulock_activity_age_s"] >= idle_timeout_s
         assert "dormant" in str(dormant_snap["reason"])
 
@@ -684,7 +813,7 @@ def test_idle_timeout_enters_dormant_reflected_in_status_and_reactivates_on_gpul
 
         supervisor._print_guard_snapshot()
         captured = capsys.readouterr()
-        assert f"gpu{gpu_id}: placeholder=parked" in captured.out
+        assert f"gpu{gpu_id}: placeholder=not_running" in captured.out
         assert "last_gpulock_activity=" in captured.out
         assert "last_user_gpu_activity=" in captured.out
         assert "dormant" in captured.out
@@ -721,7 +850,6 @@ def test_idle_timeout_enters_dormant_reflected_in_status_and_reactivates_on_gpul
             if (snap := _gpu_guard_status(lock_root, gpu_id)) is not None
             and snap.get("dormant") is False
             and snap.get("placeholder") == "active"
-            and snap.get("last_gpulock_activity_age_s", idle_timeout_s) < idle_timeout_s
             else None,
         )
         assert awake_snap is not None

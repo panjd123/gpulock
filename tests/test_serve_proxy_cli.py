@@ -170,11 +170,12 @@ def test_serve_proxy_cli_end_to_end(run_cli, lock_root: Path):
 
         # A real request is proxied to the backend.
         url = f"http://127.0.0.1:{listen_port}/v1/chat/completions"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.time() + 10
         body = None
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(url, data=b"{}", timeout=2) as r:
+                with opener.open(url, data=b"{}", timeout=2) as r:
                     body = r.read()
                 break
             except Exception:

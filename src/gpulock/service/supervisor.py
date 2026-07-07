@@ -424,6 +424,7 @@ def status() -> int:
     print(f"gpu_ids:      {cfg.gpu_ids or '<all visible GPUs>'}")
     print(f"idle_timeout: {cfg.idle_timeout}s")
     print(f"guard_poll_s: {cfg.guard_poll_s}s")
+    print(f"placeholder_release_mode: {cfg.placeholder_release_mode}")
     print(f"supervisord:  {'running (pid=' + str(pid) + ')' if pid else 'stopped'}")
     if pid == 0:
         return 3

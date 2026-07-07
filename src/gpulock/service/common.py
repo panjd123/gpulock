@@ -8,6 +8,10 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from ..config import (
+    DEFAULT_PLACEHOLDER_RELEASE_MODE,
+    normalize_placeholder_release_mode,
+)
 from ..paths import resolve_lock_root
 
 
@@ -64,9 +68,13 @@ class GuardServiceConfig:
     placeholder_idle_s: float = DEFAULT_PLACEHOLDER_IDLE_S
     guard_poll_s: float = DEFAULT_GUARD_POLL_S
     placeholder_mem_ratio: float = DEFAULT_PLACEHOLDER_MEM_RATIO
+    placeholder_release_mode: str = DEFAULT_PLACEHOLDER_RELEASE_MODE
     extra_env: dict[str, str] = field(default_factory=dict)
     python_executable: str = ""
     gpulock_executable: str = ""
+
+    def __post_init__(self) -> None:
+        self.placeholder_release_mode = normalize_placeholder_release_mode(self.placeholder_release_mode)
 
     def to_guard_argv(self) -> list[str]:
         return [
@@ -76,6 +84,7 @@ class GuardServiceConfig:
             "--placeholder-idle-s", str(self.placeholder_idle_s),
             "--guard-poll-s", str(self.guard_poll_s),
             "--placeholder-mem-ratio", str(self.placeholder_mem_ratio),
+            "--placeholder-release-mode", self.placeholder_release_mode,
         ]
 
     def save(self, lock_root: Path | None = None) -> Path:
@@ -99,6 +108,9 @@ class GuardServiceConfig:
             placeholder_idle_s=float(data.get("placeholder_idle_s", DEFAULT_PLACEHOLDER_IDLE_S)),
             guard_poll_s=float(data.get("guard_poll_s", DEFAULT_GUARD_POLL_S)),
             placeholder_mem_ratio=float(data.get("placeholder_mem_ratio", DEFAULT_PLACEHOLDER_MEM_RATIO)),
+            placeholder_release_mode=normalize_placeholder_release_mode(
+                data.get("placeholder_release_mode", DEFAULT_PLACEHOLDER_RELEASE_MODE)
+            ),
             extra_env={str(k): str(v) for k, v in dict(data.get("extra_env", {})).items()},
             python_executable=str(data.get("python_executable", "")),
             gpulock_executable=str(data.get("gpulock_executable", "")),

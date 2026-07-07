@@ -14,6 +14,7 @@ from gpulock.service.common import (
     DEFAULT_PLACEHOLDER_IDLE_S,
     DEFAULT_PLACEHOLDER_MEM_RATIO,
 )
+from gpulock.config import DEFAULT_PLACEHOLDER_RELEASE_MODE, PLACEHOLDER_RELEASE_PARK
 
 
 def test_guard_service_config_round_trip(lock_root):
@@ -44,6 +45,8 @@ def test_guard_service_config_round_trip(lock_root):
         "0.25",
         "--placeholder-mem-ratio",
         str(DEFAULT_PLACEHOLDER_MEM_RATIO),
+        "--placeholder-release-mode",
+        DEFAULT_PLACEHOLDER_RELEASE_MODE,
     ]
 
 
@@ -100,6 +103,7 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
     assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert saved_cfg["placeholder_mem_ratio"] == DEFAULT_PLACEHOLDER_MEM_RATIO
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
     assert "placeholder_load" not in saved_cfg
     assert "placeholder_util_threshold" not in saved_cfg
     assert saved_cfg["extra_env"]["FOO"] == "bar"
@@ -127,6 +131,7 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert "gpu_ids=0,1" in proc.stdout
     assert "idle_timeout=600" in proc.stdout
     assert f"placeholder_idle_s={DEFAULT_PLACEHOLDER_IDLE_S}" in proc.stdout
+    assert f"placeholder_release_mode={DEFAULT_PLACEHOLDER_RELEASE_MODE}" in proc.stdout
 
     proc = run_cli(["service", "config", "get", "idle_timeout"])
     assert proc.returncode == 0
@@ -170,6 +175,16 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     saved_cfg5 = json.loads((service_dir / "config.json").read_text())
     assert saved_cfg5["guard_poll_s"] == DEFAULT_GUARD_POLL_S
 
+    proc = run_cli(["service", "config", "set", f"placeholder_release_mode={PLACEHOLDER_RELEASE_PARK}"])
+    assert proc.returncode == 0
+    saved_cfg6 = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg6["placeholder_release_mode"] == PLACEHOLDER_RELEASE_PARK
+
+    proc = run_cli(["service", "config", "unset", "placeholder_release_mode"])
+    assert proc.returncode == 0
+    saved_cfg7 = json.loads((service_dir / "config.json").read_text())
+    assert saved_cfg7["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
+
     proc = run_cli(["service", "uninstall"])
     assert proc.returncode == 0, proc.stderr
     assert not (service_dir / "config.json").exists()
@@ -205,6 +220,7 @@ def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cl
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
     assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert saved_cfg["placeholder_mem_ratio"] == 0.0
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
 
 
 def test_service_config_preset_handy_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
@@ -228,6 +244,7 @@ def test_service_config_preset_handy_uses_single_gpu(run_cli, lock_root, cli_env
     assert saved_cfg["gpu_ids"] == [0]
     assert saved_cfg["idle_timeout"] == 315360000
     assert saved_cfg["placeholder_mem_ratio"] == 0.0
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
 
 
 def test_service_config_preset_handy_fails_without_detected_gpus(
@@ -286,6 +303,7 @@ def test_service_config_preset_all_selects_all_gpus(run_cli, lock_root, cli_env,
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
     assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert saved_cfg["placeholder_mem_ratio"] == 0.0
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
 
 
 def test_service_config_preset_all_uses_single_gpu(run_cli, lock_root, cli_env, tmp_path):
@@ -309,6 +327,7 @@ def test_service_config_preset_all_uses_single_gpu(run_cli, lock_root, cli_env, 
     assert saved_cfg["gpu_ids"] == [0]
     assert saved_cfg["idle_timeout"] == 315360000
     assert saved_cfg["placeholder_mem_ratio"] == 0.0
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
 
 
 def test_service_config_preset_all_fails_without_detected_gpus(
@@ -347,6 +366,7 @@ def test_service_config_preset_default_restores_defaults(run_cli, lock_root):
         "--placeholder-idle-s", "5.0",
         "--guard-poll-s", "1.0",
         "--placeholder-mem-ratio", "0.5",
+        "--placeholder-release-mode", "park",
     ])
     assert proc.returncode == 0, proc.stderr
 
@@ -361,6 +381,7 @@ def test_service_config_preset_default_restores_defaults(run_cli, lock_root):
     assert saved_cfg["placeholder_idle_s"] == DEFAULT_PLACEHOLDER_IDLE_S
     assert saved_cfg["guard_poll_s"] == DEFAULT_GUARD_POLL_S
     assert saved_cfg["placeholder_mem_ratio"] == DEFAULT_PLACEHOLDER_MEM_RATIO
+    assert saved_cfg["placeholder_release_mode"] == DEFAULT_PLACEHOLDER_RELEASE_MODE
 
 
 def test_service_status_prints_guard_snapshot(lock_root, monkeypatch, capsys):

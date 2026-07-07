@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import LockConfig, READ_MODE, StaleLockProbe, WRITE_MODE
+from .config import PLACEHOLDER_RELEASE_PARK, PLACEHOLDER_RELEASE_STOP
 from .gpu import (
     gpu_busy_reason_for_perf,
     gpu_has_processes_by_index,
@@ -30,7 +31,43 @@ from .paths import (
     read_lock_pid,
     resolve_lock_root,
 )
-from .placeholder import kill_placeholder, park_placeholder
+from .placeholder import kill_placeholder, park_placeholder, stop_placeholder
+
+
+def release_placeholder_for_work(
+    gpu_dir: Path,
+    physical_device_id: int,
+    release_mode: str,
+    *,
+    log: logging.Logger | None = None,
+    reason: str = "lock acquire",
+) -> None:
+    """Release a gpulock placeholder before real GPU work starts.
+
+    ``park`` is the legacy fast path: the worker keeps its CUDA context resident.
+    ``stop`` is the clean path: the worker exits so profiling/autotune/JIT sees
+    no second placeholder CUDA context.
+    """
+    logger = log or logging.getLogger("gpulock.main")
+    if release_mode == PLACEHOLDER_RELEASE_PARK:
+        if park_placeholder(gpu_dir, timeout_s=5.0):
+            logger.info("gpu%d: parked placeholder worker before %s", physical_device_id, reason)
+            return
+        kill_placeholder(gpu_dir)
+        kill_visible_placeholder_compute_pids(physical_device_id)
+        return
+
+    if release_mode != PLACEHOLDER_RELEASE_STOP:
+        raise ValueError(f"unsupported placeholder release mode: {release_mode!r}")
+
+    stopped = stop_placeholder(gpu_dir, timeout_s=5.0)
+    if stopped:
+        logger.info("gpu%d: stopped placeholder worker before %s", physical_device_id, reason)
+    else:
+        kill_placeholder(gpu_dir)
+    kill_visible_placeholder_compute_pids(physical_device_id)
+    (gpu_dir / "placeholder.pid").unlink(missing_ok=True)
+    (gpu_dir / "placeholder.sock").unlink(missing_ok=True)
 
 
 def notify_guard_activity(lock_root: Path, gpu_id: int, mode: str) -> None:
@@ -447,11 +484,12 @@ class GpuLock:
     def acquire(self) -> None:
         log = logging.getLogger("gpulock.main")
         notify_guard_activity(self.root, self.physical_device_id, self.mode)
-        if park_placeholder(self.gpu_dir, timeout_s=5.0):
-            log.info("gpu%d: parked placeholder worker before lock acquire", self.physical_device_id)
-        else:
-            kill_placeholder(self.gpu_dir)
-            kill_visible_placeholder_compute_pids(self.physical_device_id)
+        release_placeholder_for_work(
+            self.gpu_dir,
+            self.physical_device_id,
+            self.config.placeholder_release_mode,
+            log=log,
+        )
         self._ensure_write_lock_gpu_ready()
         acquired = False
         deadline = time.monotonic() + self.config.timeout_s
