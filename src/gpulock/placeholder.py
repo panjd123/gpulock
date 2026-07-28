@@ -114,8 +114,19 @@ def kill_placeholder(gpu_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CUDAGraph helpers (used only inside the placeholder process)
+# CUDAGraph workload helpers (used only inside the placeholder process)
 # ---------------------------------------------------------------------------
+
+_PLACEHOLDER_WORKLOAD_NAME = "gentle-training"
+_PLACEHOLDER_TARGET_REPLAY_S = 0.039
+_PLACEHOLDER_IDLE_SLEEP_S = 0.008
+_PLACEHOLDER_CALIBRATION_ITERS = 2
+_PLACEHOLDER_REPLAY_TOLERANCE = 0.15
+_PLACEHOLDER_SLEEP_CYCLES = 8_000_000
+_PLACEHOLDER_FEATURE_ROWS = 1024
+_PLACEHOLDER_FEATURE_COLS = 1024
+_PLACEHOLDER_GEMM_DIM = 1024
+
 
 def _round_up_multiple(value: int, granularity: int) -> int:
     granularity = max(granularity, 1)
@@ -135,39 +146,80 @@ def _cuda_elapsed_s(torch, stream, work) -> float:
     return max(start.elapsed_time(end) / 1000.0, 0.0)
 
 
-def _measure_mm_loop_s(torch, stream, load_a, load_b, load_c, iters: int) -> float:
+def _make_placeholder_workload(torch) -> dict[str, object]:
+    feature_shape = (_PLACEHOLDER_FEATURE_ROWS, _PLACEHOLDER_FEATURE_COLS)
+    gemm_shape = (_PLACEHOLDER_GEMM_DIM, _PLACEHOLDER_GEMM_DIM)
+    stats = torch.empty((_PLACEHOLDER_FEATURE_ROWS,), dtype=torch.float32, device="cuda:0")
+    sleep_cycles = _PLACEHOLDER_SLEEP_CYCLES if hasattr(torch.cuda, "_sleep") else 0
+    return {
+        "feature": torch.randn(feature_shape, dtype=torch.float32, device="cuda:0"),
+        "activation": torch.randn(feature_shape, dtype=torch.float32, device="cuda:0"),
+        "gate": torch.randn(feature_shape, dtype=torch.float32, device="cuda:0"),
+        "scratch": torch.empty(feature_shape, dtype=torch.float32, device="cuda:0"),
+        "stats": stats,
+        "stats_view": stats.view(_PLACEHOLDER_FEATURE_ROWS, 1),
+        "inv_cols": 1.0 / float(_PLACEHOLDER_FEATURE_COLS),
+        "sleep_cycles": sleep_cycles,
+        "gemm_a": torch.randn(gemm_shape, dtype=torch.float16, device="cuda:0"),
+        "gemm_b": torch.randn(gemm_shape, dtype=torch.float16, device="cuda:0"),
+        "gemm_c": torch.empty(gemm_shape, dtype=torch.float16, device="cuda:0"),
+    }
+
+
+def _run_placeholder_workload_iteration(torch, workload: dict[str, object]) -> None:
+    feature = workload["feature"]
+    activation = workload["activation"]
+    gate = workload["gate"]
+    scratch = workload["scratch"]
+    stats = workload["stats"]
+    stats_view = workload["stats_view"]
+
+    sleep_cycles = int(workload["sleep_cycles"])
+    if sleep_cycles > 0:
+        torch.cuda._sleep(sleep_cycles)
+    torch.addcmul(feature, activation, gate, value=0.0007, out=scratch)
+    torch.sigmoid(scratch, out=gate)
+    torch.mul(scratch, gate, out=activation)
+    torch.sum(activation, dim=1, out=stats)
+    torch.mul(stats, workload["inv_cols"], out=stats)
+    torch.add(activation, stats_view, alpha=-0.25, out=feature)
+    torch.mm(workload["gemm_a"], workload["gemm_b"], out=workload["gemm_c"])
+    torch.add(feature, scratch, alpha=0.125, out=feature)
+
+
+def _measure_workload_loop_s(torch, stream, workload: dict[str, object], iters: int) -> float:
     def work():
         for _ in range(max(iters, 1)):
-            torch.mm(load_a, load_b, out=load_c)
+            _run_placeholder_workload_iteration(torch, workload)
 
     return _cuda_elapsed_s(torch, stream, work)
 
 
-def _capture_placeholder_graph(torch, load_a, load_b, load_c, iters: int):
+def _capture_placeholder_graph(torch, workload: dict[str, object], iters: int):
     capture_stream = torch.cuda.Stream()
-    warmup_iters = min(max(iters, 1), 128)
+    warmup_iters = min(max(iters, 1), 64)
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
-        for _ in range(3):
+        for _ in range(2):
             for _ in range(warmup_iters):
-                torch.mm(load_a, load_b, out=load_c)
+                _run_placeholder_workload_iteration(torch, workload)
     capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         for _ in range(max(iters, 1)):
-            torch.mm(load_a, load_b, out=load_c)
+            _run_placeholder_workload_iteration(torch, workload)
     capture_stream.synchronize()
     return graph, capture_stream
 
 
-def build_placeholder_graph(torch, load_a, load_b, load_c):
-    target_replay_s = 0.049
-    calibration_iters = 128
-    tolerance = 0.12
+def build_placeholder_graph(torch, workload: dict[str, object]):
+    target_replay_s = _PLACEHOLDER_TARGET_REPLAY_S
+    calibration_iters = _PLACEHOLDER_CALIBRATION_ITERS
+    tolerance = _PLACEHOLDER_REPLAY_TOLERANCE
     calibration_stream = torch.cuda.Stream()
-    eager_sample_s = _measure_mm_loop_s(torch, calibration_stream, load_a, load_b, load_c, calibration_iters)
+    eager_sample_s = _measure_workload_loop_s(torch, calibration_stream, workload, calibration_iters)
     if eager_sample_s <= 0.0:
-        raise RuntimeError("failed to measure eager GEMM sample time")
+        raise RuntimeError("failed to measure eager placeholder workload sample time")
 
     per_iter_s = eager_sample_s / calibration_iters
     graph_iters = _round_up_multiple(int(target_replay_s / per_iter_s), calibration_iters)
@@ -177,7 +229,7 @@ def build_placeholder_graph(torch, load_a, load_b, load_c):
     best_stream = None
     best_replay_s = 0.0
     for _ in range(2):
-        graph, replay_stream = _capture_placeholder_graph(torch, load_a, load_b, load_c, graph_iters)
+        graph, replay_stream = _capture_placeholder_graph(torch, workload, graph_iters)
         replay_s = _cuda_elapsed_s(torch, replay_stream, graph.replay)
         best_graph = graph
         best_stream = replay_stream
@@ -230,15 +282,14 @@ def placeholder_main(gpu_id: int, mem_ratio: float = 0.85) -> int:
         print(f"[gpulock] placeholder gpu{gpu_id}: {e}", file=sys.stderr)
         return 1
 
-    idle_sleep_s = 0.001
+    idle_sleep_s = _PLACEHOLDER_IDLE_SLEEP_S
     state: dict[str, object] = {
         "buf": None,
         "graph": None,
         "replay_stream": None,
-        "load_a": None,
-        "load_b": None,
-        "load_c": None,
-        "load_iters": 0,
+        "workload": None,
+        "workload_iters": 0,
+        "workload_sleep_cycles": 0,
         "eager_sample_s": 0.0,
         "replay_s": 0.0,
     }
@@ -252,11 +303,10 @@ def placeholder_main(gpu_id: int, mem_ratio: float = 0.85) -> int:
             torch.cuda.synchronize()
         state["graph"] = None
         state["replay_stream"] = None
-        state["load_a"] = None
-        state["load_b"] = None
-        state["load_c"] = None
+        state["workload"] = None
         state["buf"] = None
-        state["load_iters"] = 0
+        state["workload_iters"] = 0
+        state["workload_sleep_cycles"] = 0
         state["eager_sample_s"] = 0.0
         state["replay_s"] = 0.0
         with contextlib.suppress(Exception):
@@ -280,26 +330,26 @@ def placeholder_main(gpu_id: int, mem_ratio: float = 0.85) -> int:
             )
         if state["graph"] is not None:
             return
-        load_dim = 2048
-        load_a = torch.randn((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
-        load_b = torch.randn((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
-        load_c = torch.empty((load_dim, load_dim), dtype=torch.float16, device="cuda:0")
-        graph, replay_stream, load_iters, eager_sample_s, replay_s = build_placeholder_graph(
-            torch, load_a, load_b, load_c
+        workload = _make_placeholder_workload(torch)
+        graph, replay_stream, workload_iters, eager_sample_s, replay_s = build_placeholder_graph(
+            torch, workload
         )
         state["graph"] = graph
         state["replay_stream"] = replay_stream
-        state["load_a"] = load_a
-        state["load_b"] = load_b
-        state["load_c"] = load_c
-        state["load_iters"] = load_iters
+        state["workload"] = workload
+        state["workload_iters"] = workload_iters
+        state["workload_sleep_cycles"] = int(workload["sleep_cycles"])
         state["eager_sample_s"] = eager_sample_s
         state["replay_s"] = replay_s
         mode_str = "compute-only" if compute_only else f"mem_ratio={mem_ratio:.2f}"
+        active_fraction = replay_s / (replay_s + idle_sleep_s) if replay_s > 0.0 else 0.0
         print(
-            f"[gpulock] placeholder gpu{gpu_id}: CUDAGraph replay enabled "
-            f"({mode_str}, dim={load_dim}, iters={load_iters}, eager_sample={eager_sample_s:.6f}s/128, "
-            f"replay={replay_s:.6f}s, sleep={idle_sleep_s:.3f}s)",
+            f"[gpulock] placeholder gpu{gpu_id}: CUDAGraph {_PLACEHOLDER_WORKLOAD_NAME} workload enabled "
+            f"({mode_str}, feature={_PLACEHOLDER_FEATURE_ROWS}x{_PLACEHOLDER_FEATURE_COLS} fp32, "
+            f"tc_gemm={_PLACEHOLDER_GEMM_DIM}x{_PLACEHOLDER_GEMM_DIM} fp16, "
+            f"sleep_cycles={int(workload['sleep_cycles'])}, "
+            f"iters={workload_iters}, eager_sample={eager_sample_s:.6f}s/{_PLACEHOLDER_CALIBRATION_ITERS}, "
+            f"replay={replay_s:.6f}s, sleep={idle_sleep_s:.3f}s, active_fraction={active_fraction:.2f})",
             flush=True,
         )
 
@@ -325,7 +375,9 @@ def placeholder_main(gpu_id: int, mem_ratio: float = 0.85) -> int:
         if command == "status":
             return (
                 f"ok state={state_label()} "
-                f"iters={int(state['load_iters'])} replay_s={float(state['replay_s']):.6f}"
+                f"workload={_PLACEHOLDER_WORKLOAD_NAME} "
+                f"iters={int(state['workload_iters'])} replay_s={float(state['replay_s']):.6f} "
+                f"sleep_s={idle_sleep_s:.6f} sleep_cycles={int(state['workload_sleep_cycles'])}"
             )
         return f"error unknown_command={command}"
 

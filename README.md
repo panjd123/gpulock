@@ -57,7 +57,8 @@ gpulock service restart
 gpulock check 0 -- python tests/test_kernel.py      # shared read lock    (correctness)
 gpulock perf 0,1 -- python benchmarks/run.py         # exclusive write lock (performance)
 
-# 4. (Optional) configure AI agents: let an agent install the prompt into AGENTS.md for you
+# 4. Agent policy is installed automatically into common global AGENTS.md files.
+#    To inspect or install manually:
 gpulock agent --help
 agent -p -f "$(gpulock agent --local)"
 ```
@@ -100,6 +101,7 @@ gpulock read  <gpu_ids> -- <cmd>     # alias for check
 gpulock perf  <gpu_ids> -- <cmd>     # write lock — exclusive; suited to perf/profiling
 gpulock write <gpu_ids> -- <cmd>     # alias for perf
 gpulock serve <listen>:<backend> <gpu_ids> -- <cmd>   # inference server behind a request-aware reverse proxy
+gpulock update                       # git pull --ff-only, then restart the service if it was running
 ```
 
 - `<gpu_ids>` is a single index (`0`) or a comma-separated list (`0,1,2`). IDs are sorted and deduplicated.
@@ -244,6 +246,13 @@ Add or replace blacklist entries with `--ignore [METHOD:]PATH` (repeatable),
 
 When coding agents run on a shared GPU host, add the contents of [`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) to the agent's guidelines. The prompt instructs agents to wrap every GPU-touching command in `gpulock` and explains when to choose `check` versus `perf`, without embedding `gpulock` in the project's own scripts.
 
+`gpulock service install` writes the policy block into common global agent instruction files:
+
+- `~/.codex/AGENTS.md`
+- `~/.trae/AGENTS.md`
+
+The block is wrapped in `<!-- gpulock:start -->` / `<!-- gpulock:end -->`, so repeated installs update it in place instead of duplicating it. Use `gpulock service install --no-agent-policy` if you only want the guard service and do not want installer-managed global agent instructions.
+
 The policy ships inside the package, so you do not need to track the file down. Run `gpulock agent` to print it:
 
 ```bash
@@ -300,7 +309,7 @@ gpulock service config unset <key>
 gpulock service config preset handy   # persistent reservation; leaves one card free
 ```
 
-**Lifecycle.** While a GPU is idle, the guard activates a placeholder that allocates approximately 85% of device memory and runs a small CUDAGraph GEMM loop to sustain utilization. It yields to real work in two ways: when it detects a `gpulock` lock or activity pulse on the GPU it **parks** the placeholder, releasing the compute load so the job runs without interference; and it will not (re)activate a placeholder while a non-placeholder compute process owned by the guard's user is using the GPU. After `idle_timeout` seconds with no recent user GPU activity, the placeholder becomes **dormant** and releases both memory and compute; subsequent `gpulock` activity or user-owned GPU compute reactivates it. The placeholder appears in `nvidia-smi` under the process title `tensorrt_engine_cache`.
+**Lifecycle.** While a GPU is idle, the guard activates a placeholder that allocates approximately 85% of device memory and runs a throttled CUDAGraph workload made mostly of FP32 elementwise/reduction work with a small FP16 GEMM component. This keeps GPU utilization visible without driving Tensor Cores at a sustained peak. It yields to real work in two ways: when it detects a `gpulock` lock or activity pulse on the GPU it **parks** the placeholder, releasing the compute load so the job runs without interference; and it will not (re)activate a placeholder while a non-placeholder compute process owned by the guard's user is using the GPU. After `idle_timeout` seconds with no recent user GPU activity, the placeholder becomes **dormant** and releases both memory and compute; subsequent `gpulock` activity or user-owned GPU compute reactivates it. The placeholder appears in `nvidia-smi` under the process title `tensorrt_engine_cache`.
 
 **What counts as activity.** The guard appends events to a single `gpu_activity` table (`activity_type` = `gpulock` or `user_gpu`). The latest timestamp per GPU and type is fetched via an index on `(gpu_id, activity_type, ts DESC)`; rows are never deleted. **Last gpulock activity** covers a held lock or a starting `gpulock` run; **last user GPU activity** covers non-placeholder compute owned by the guard's UID. The `idle_timeout` / dormant timer resets when **either** is recent. `gpulock service status` shows both ages.
 
@@ -316,6 +325,8 @@ guard.log
 ```
 
 Adjust `gpu_ids`, `idle_timeout`, `placeholder_idle_s`, or `guard_poll_s` with `config set` or `config edit`, then run `gpulock service restart` to apply the changes.
+
+Use `gpulock update` to update an editable gpulock checkout in place. It refuses to run when the repository has uncommitted changes, runs `git pull --ff-only`, and restarts the guard service only if the service was running before the update.
 
 ---
 
@@ -342,7 +353,7 @@ The sections below are reference material — the precise semantics, internals, 
    ┌──────────────────────────────────────────────────────────────────┐
    │  guard service (supervisord)                                       │
    │  watches each GPU; when idle, activates a placeholder that holds   │
-   │  memory + a CUDAGraph compute loop; parks it on any gpulock        │
+   │  memory + a throttled CUDAGraph mixed workload; parks it on any    │
    │  activity; goes dormant after idle_timeout without user GPU work.  │
    └──────────────────────────────────────────────────────────────────┘
 ```

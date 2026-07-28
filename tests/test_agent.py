@@ -6,6 +6,8 @@ from gpulock.agent import (
     MARKER_END,
     MARKER_START,
     build_agent_output,
+    build_policy_block,
+    install_policy_block,
     load_agent_prompt,
 )
 
@@ -76,3 +78,34 @@ def test_agent_rejects_combining_scopes(run_cli):
 
     assert proc.returncode == 2
     assert "not allowed with" in proc.stderr or "usage:" in proc.stderr
+
+
+def test_install_policy_block_is_idempotent(tmp_path):
+    agents = tmp_path / "AGENTS.md"
+    block = build_policy_block()
+
+    assert install_policy_block(agents, block) is True
+    first = agents.read_text(encoding="utf-8")
+    assert first == block
+
+    assert install_policy_block(agents, block) is False
+    assert agents.read_text(encoding="utf-8") == first
+    assert first.count(MARKER_START) == 1
+    assert first.count(MARKER_END) == 1
+
+
+def test_install_policy_block_replaces_existing_marked_block(tmp_path):
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text(
+        f"before\n\n{MARKER_START}\nold policy\n{MARKER_END}\n\nafter\n",
+        encoding="utf-8",
+    )
+
+    assert install_policy_block(agents, build_policy_block()) is True
+    updated = agents.read_text(encoding="utf-8")
+
+    assert updated.startswith("before\n\n")
+    assert updated.endswith("\n\nafter\n")
+    assert "old policy" not in updated
+    assert updated.count(MARKER_START) == 1
+    assert updated.count(MARKER_END) == 1

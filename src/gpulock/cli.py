@@ -24,6 +24,7 @@ from .paths import resolve_lock_root
 from .placeholder import placeholder_main
 from .service import cmd_service
 from .session import MultiGpuLock
+from .update import cmd_update
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -675,6 +676,8 @@ def main() -> int:
             return cmd_service(sys.argv[2:])
         if sub == "agent":
             return cmd_agent(sys.argv[2:])
+        if sub == "update":
+            return cmd_update(sys.argv[2:])
         if sub == "serve":
             # Reverse-proxy serve mode: the first token after `serve` is a
             # [host:]<listen>:<backend> spec. Otherwise fall through to the

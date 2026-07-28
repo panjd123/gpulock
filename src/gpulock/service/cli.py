@@ -9,6 +9,7 @@ import subprocess
 import sys
 from typing import Any, Callable
 
+from ..agent import install_global_agent_policies
 from ..gpu import gpu_indices
 from ..config import (
     DEFAULT_PLACEHOLDER_RELEASE_MODE,
@@ -151,6 +152,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-start", action="store_true",
         help="don't start the service immediately after installing",
     )
+    p_install.add_argument(
+        "--no-agent-policy", action="store_true",
+        help="skip installing the gpulock policy block into global AGENTS.md files",
+    )
 
     sub.add_parser("uninstall", help="stop the service and remove its config")
     sub.add_parser("start", help="start supervisord (and the guard program)")
@@ -204,6 +209,10 @@ def _do_install(args: argparse.Namespace) -> int:
     rc = supervisor_backend.install(cfg, start_now=not args.no_start)
     say(f"config saved to {GuardServiceConfig.config_path()}")
     say(f"supervisord conf at {supervisor_backend.conf_path()}")
+    if not args.no_agent_policy:
+        for path, changed in install_global_agent_policies():
+            status = "updated" if changed else "unchanged"
+            say(f"agent policy {status}: {path}")
     if args.no_start:
         say("not started (--no-start). start later with `gpulock service start`.")
     return rc

@@ -53,7 +53,8 @@ gpulock service restart
 gpulock check 0 -- python tests/test_kernel.py      # 共享读锁    （正确性）
 gpulock perf 0,1 -- python benchmarks/run.py         # 独占写锁    （性能）
 
-# 4.（可选）配置 AI Agent: 你可以用以下方式让 AI 帮你安装 prompt 到 AGENTS.md
+# 4. 安装时会自动把 agent 策略写入常见的全局 AGENTS.md。
+#    如需查看或手动安装:
 gpulock agent --help
 agent -p -f "$(gpulock agent --local)"
 ```
@@ -96,6 +97,7 @@ gpulock read  <gpu_ids> -- <cmd>     # check 的别名
 gpulock perf  <gpu_ids> -- <cmd>     # 写锁  —— 独占；适合性能测试 / profiling
 gpulock write <gpu_ids> -- <cmd>     # perf 的别名
 gpulock serve <listen>:<backend> <gpu_ids> -- <cmd>   # 通过请求感知反向代理托管推理服务
+gpulock update                       # git pull --ff-only；若服务此前在运行，则更新后重启
 ```
 
 - `<gpu_ids>` 可以是单个编号（`0`），也可以是逗号分隔的列表（`0,1,2`）。编号会被排序并去重。
@@ -201,6 +203,13 @@ context），并且在后端就绪前不重新拉起。
 
 当 coding agent 运行在共享 GPU 主机上时，将 [`GPULOCK_AGENT_PROMPT.md`](src/gpulock/data/GPULOCK_AGENT_PROMPT.md) 的内容加入 agent 指南。该 prompt 会指示 agent 把每一条涉及 GPU 的命令都用 `gpulock` 包装，并说明何时选择 `check`、何时选择 `perf`，同时不会把 `gpulock` 嵌入项目自身的脚本。
 
+`gpulock service install` 会把策略块写入常见的全局 agent 指令文件：
+
+- `~/.codex/AGENTS.md`
+- `~/.trae/AGENTS.md`
+
+策略块会被 `<!-- gpulock:start -->` / `<!-- gpulock:end -->` 标记包裹，因此重复安装会原地更新，不会重复追加。若只想安装 guard service，不希望安装器管理全局 agent 指令，可以使用 `gpulock service install --no-agent-policy`。
+
 该 prompt 已打包进项目内部，因此你无需自己去找这个文件，直接运行 `gpulock agent` 即可打印：
 
 ```bash
@@ -257,7 +266,7 @@ gpulock service config unset <key>
 gpulock service config preset handy   # 持久预留；空出一张卡
 ```
 
-**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个小的 CUDAGraph GEMM 循环以维持利用率。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有属于 guard 同 UID 的非 placeholder 计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有用户 GPU 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后 `gpulock` 活动或本用户的 GPU 计算会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
+**生命周期。** GPU 空闲时，守护进程激活一个 placeholder，分配约 85% 的设备显存，并运行一个限速的 CUDAGraph 混合负载：主体是 FP32 elementwise/reduction，附带少量 FP16 GEMM。这样可以维持可见的 GPU 利用率，同时避免持续把 Tensor Core 顶到峰值。它通过两种方式给真实任务让位：当在该 GPU 上检测到 `gpulock` 锁或活动脉冲（activity pulse）时，会 **park**（停泊）placeholder，释放计算负载，使任务不受干扰地运行；并且在有属于 guard 同 UID 的非 placeholder 计算进程正在使用该 GPU 时，不会（重新）激活 placeholder。在连续 `idle_timeout` 秒内没有用户 GPU 活动后，placeholder 进入 **dormant**（休眠），彻底释放显存与计算；此后 `gpulock` 活动或本用户的 GPU 计算会将其重新激活。placeholder 在 `nvidia-smi` 中以进程名 `tensorrt_engine_cache` 显示。
 
 **什么算作"活动"。** guard 向单张 `gpu_activity` 表追加事件（`activity_type` 为 `gpulock` 或 `user_gpu`），通过 `(gpu_id, activity_type, ts DESC)` 索引快速取最近一条，**从不删除**历史行。**最近一次 gpulock 活动**指持有锁或发起 `gpulock` 运行；**最近一次本用户 GPU 活动**指 guard 同 UID 的非 placeholder 计算进程。`idle_timeout` / dormant 在**任一**活动仍处窗口内时不触发。`gpulock service status` 分别显示两个时间。
 
@@ -273,6 +282,8 @@ guard.log
 ```
 
 用 `config set` 或 `config edit` 调整 `gpu_ids`、`idle_timeout`、`placeholder_idle_s` 或 `guard_poll_s`，然后执行 `gpulock service restart` 使更改生效。
+
+用 `gpulock update` 可就地更新 editable gpulock checkout。仓库有未提交改动时它会拒绝执行；更新使用 `git pull --ff-only`；只有当更新前 guard service 正在运行时，更新后才会自动重启 service。
 
 ---
 
@@ -298,8 +309,8 @@ guard.log
 
    ┌──────────────────────────────────────────────────────────────────┐
    │  守护服务（由 supervisord 托管）                                   │
-   │  监控每张 GPU；空闲时激活 placeholder，占用显存 + 一个 CUDAGraph   │
-   │  计算循环；检测到 gpulock 活动即 park；长时间空闲后进入            │
+   │  监控每张 GPU；空闲时激活 placeholder，占用显存 + 一个限速的       │
+   │  CUDAGraph 混合负载；检测到 gpulock 活动即 park；长时间空闲后进入  │
    │  dormant（休眠）。                                                 │
    └──────────────────────────────────────────────────────────────────┘
 ```

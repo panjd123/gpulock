@@ -21,10 +21,14 @@ def lock_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def cli_env(lock_root: Path) -> dict[str, str]:
+def cli_env(lock_root: Path, tmp_path: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GPULOCK_LOCK_DIR"] = str(lock_root)
     env["PYTHONPATH"] = str(REPO / "src")
+    env["GPULOCK_AGENT_GLOBAL_PATHS"] = os.pathsep.join([
+        str(tmp_path / "agent-home" / ".codex" / "AGENTS.md"),
+        str(tmp_path / "agent-home" / ".trae" / "AGENTS.md"),
+    ])
     return env
 
 

@@ -14,15 +14,27 @@ The intended use is to feed the output to a coding-agent CLI, e.g.
 from __future__ import annotations
 
 import argparse
+import os
+import re
 from importlib.resources import files
+from pathlib import Path
 
 PROMPT_RESOURCE = "data/GPULOCK_AGENT_PROMPT.md"
 
 MARKER_START = "<!-- gpulock:start -->"
 MARKER_END = "<!-- gpulock:end -->"
+_MARKED_BLOCK_RE = re.compile(
+    rf"{re.escape(MARKER_START)}.*?{re.escape(MARKER_END)}",
+    re.DOTALL,
+)
 
 LOCAL = "local"
 GLOBAL = "global"
+
+DEFAULT_GLOBAL_AGENT_PATHS = (
+    Path("~/.codex/AGENTS.md"),
+    Path("~/.trae/AGENTS.md"),
+)
 
 
 def load_agent_prompt() -> str:
@@ -88,6 +100,54 @@ def build_agent_output(scope: str) -> str:
         f"{policy}\n"
         f"{MARKER_END}\n"
     )
+
+
+def build_policy_block() -> str:
+    """Return only the marked policy block suitable for direct file writes."""
+    policy = load_agent_prompt().strip("\n")
+    return f"{MARKER_START}\n{policy}\n{MARKER_END}\n"
+
+
+def install_policy_block(path: Path, block: str | None = None) -> bool:
+    """Create or update ``path`` with the marked gpulock policy block.
+
+    Returns ``True`` when the file content changed. Existing content outside the
+    marker block is preserved, and repeated calls update the block in place
+    rather than appending duplicates.
+    """
+    block = build_policy_block() if block is None else block
+    try:
+        original = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        original = ""
+
+    if _MARKED_BLOCK_RE.search(original):
+        updated = _MARKED_BLOCK_RE.sub(block.rstrip("\n"), original, count=1)
+    elif original.strip():
+        updated = f"{original.rstrip()}\n\n{block}"
+    else:
+        updated = block
+
+    if updated == original:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def global_agent_paths() -> list[Path]:
+    """Return global AGENTS.md targets for common coding-agent CLIs."""
+    override = os.getenv("GPULOCK_AGENT_GLOBAL_PATHS", "").strip()
+    if override:
+        return [Path(item).expanduser() for item in override.split(os.pathsep) if item]
+    return [path.expanduser() for path in DEFAULT_GLOBAL_AGENT_PATHS]
+
+
+def install_global_agent_policies(paths: list[Path] | None = None) -> list[tuple[Path, bool]]:
+    """Install the gpulock policy block into all global AGENTS.md targets."""
+    block = build_policy_block()
+    targets = global_agent_paths() if paths is None else paths
+    return [(path, install_policy_block(path, block)) for path in targets]
 
 
 INSTALL_HELP = """\

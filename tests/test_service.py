@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -189,6 +190,46 @@ def test_service_install_status_config_uninstall(run_cli, lock_root):
     assert proc.returncode == 0, proc.stderr
     assert not (service_dir / "config.json").exists()
     assert not (service_dir / "supervisord.conf").exists()
+
+
+def test_service_install_writes_global_agent_policies(run_cli, cli_env, tmp_path):
+    targets = [Path(item) for item in cli_env["GPULOCK_AGENT_GLOBAL_PATHS"].split(os.pathsep)]
+
+    proc = run_cli(["service", "install", "--no-start", "--gpu-ids", "0"])
+
+    assert proc.returncode == 0, proc.stderr
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        assert "<!-- gpulock:start -->" in text
+        assert "<!-- gpulock:end -->" in text
+        assert "# GPU Execution Policy For Agents" in text
+        assert f"agent policy updated: {path}" in proc.stdout
+
+    proc2 = run_cli(["service", "install", "--no-start", "--gpu-ids", "0"])
+
+    assert proc2.returncode == 0, proc2.stderr
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        assert text.count("<!-- gpulock:start -->") == 1
+        assert text.count("<!-- gpulock:end -->") == 1
+        assert f"agent policy unchanged: {path}" in proc2.stdout
+
+
+def test_service_install_can_skip_global_agent_policies(run_cli, cli_env, tmp_path):
+    targets = [Path(item) for item in cli_env["GPULOCK_AGENT_GLOBAL_PATHS"].split(os.pathsep)]
+
+    proc = run_cli([
+        "service",
+        "install",
+        "--no-start",
+        "--no-agent-policy",
+        "--gpu-ids",
+        "0",
+    ])
+
+    assert proc.returncode == 0, proc.stderr
+    assert "agent policy" not in proc.stdout
+    assert all(not path.exists() for path in targets)
 
 
 def test_service_config_preset_handy_selects_guarded_gpus(run_cli, lock_root, cli_env, tmp_path):
